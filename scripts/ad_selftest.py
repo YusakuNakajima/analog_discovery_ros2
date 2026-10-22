@@ -5,9 +5,11 @@
     ad_selftest.py --loopback         # W1 drives a square wave into CH1 (see below)
 
 --loopback needs a BNC cable from W1 to CH1 (BNC Adapter Board) and NOTHING
-else on W1 or CH1: W1 outputs a 1 kHz square wave of +-0.5 V. It checks that
-the rising edge lands at the requested pretrigger index, which verifies the
-trigger-position convention assumed in scope.py.
+else on W1 or CH1: W1 outputs a 50 Hz square wave of +-0.5 V. Its 20 ms period
+is longer than the 8.192 ms capture, so the capture holds exactly one rising
+edge; the test checks that this edge lands at the requested pretrigger index,
+which verifies the trigger-position convention assumed in scope.py (a wave
+that rose several times per capture would hide a shift of whole periods).
 """
 
 import argparse
@@ -20,8 +22,30 @@ import numpy as np
 from analog_discovery import dwf as d
 from analog_discovery.scope import AnalogDiscoveryScope, CaptureSettings
 
-SQUARE_FREQUENCY_HZ = 1e3
+SQUARE_FREQUENCY_HZ = 50.0  # period 20 ms > capture length 8.192 ms
 SQUARE_AMPLITUDE_V = 0.5
+
+
+def rising_edges(v, low_v=-0.25, high_v=0.25):
+    """Sample index of each rise from below low_v to above high_v, at the 0 V crossing."""
+    edges = []
+    armed = False
+    for i, x in enumerate(v):
+        if x < low_v:
+            armed = True
+        elif armed and x > high_v:
+            j = i
+            while j > 0 and v[j - 1] > 0.0:
+                j -= 1
+            edges.append(j)
+            armed = False
+    return edges
+
+
+def loopback_edge_ok(v, pre, tolerance=3):
+    """(ok, edges): exactly one rising edge, within tolerance samples of pre."""
+    edges = rising_edges(v)
+    return len(edges) == 1 and abs(edges[0] - pre) <= tolerance, edges
 
 
 def check(ok, text):
@@ -98,17 +122,12 @@ def main():
                         'loopback: triggered on the W1 square wave')
             if capture is not None:
                 v = capture.ch1_v
-                # The 1 kHz wave rises every 1000 samples, so take the crossing
-                # nearest to the requested position, not the first one.
-                crossings = np.nonzero((v[1:] > 0.0) & (v[:-1] <= 0.0))[0] + 1
-                crossing = (int(crossings[np.argmin(np.abs(crossings - pre))])
-                            if len(crossings) else -1)
+                edge_ok, edges = loopback_edge_ok(v, pre)
                 ok &= check(capture.trigger_index == pre,
                             f'loopback: reported trigger_index {capture.trigger_index} '
                             f'(requested {pre})')
-                ok &= check(abs(crossing - pre) <= 3,
-                            f'loopback: rising crossing nearest the trigger at sample '
-                            f'{crossing} (expected {pre})')
+                ok &= check(edge_ok, f'loopback: rising edges at {edges} '
+                            f'(expected exactly one, at {pre})')
                 ok &= check(0.4 < v.max() < 0.6 and -0.6 < v.min() < -0.4,
                             f'loopback: CH1 {v.min():+.3f}..{v.max():+.3f} V '
                             f'(W1 +-{SQUARE_AMPLITUDE_V} V)')
