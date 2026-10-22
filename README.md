@@ -97,6 +97,36 @@ CH1 に入れる前提で、2026-10-22 に実機で取った波形から決め�
   を起こすことがあった（4 プロセス中 3 回）。0.2 s 待つと 8 回中 0 回。観測した最長の約 3 倍にした暫定値
   （2026-10-22、OnoLab の実機）。
 
+## AE の特徴量（ae_features_node.py）
+
+`ae:=true` を付けると、取り込みごとに AE の特徴量を計算するノードも起動する。表示と記録のためのもので、
+ロボットへの指令は出さない。
+
+```bash
+ros2 launch analog_discovery_ros2 analog_discovery.launch.py ae:=true
+ros2 topic echo /ae_features/hit
+ros2 run rqt_plot rqt_plot /ae_features/activity/energy_rate_v2 /ae_features/activity/hit_rate_hz
+```
+
+| トピック | 型 | 内容 |
+| --- | --- | --- |
+| `/ae_features/hit` | `AeHit` | ヒットごと: ピーク振幅、立ち上がり時間、継続時間、カウント、エネルギー（∫v²dt）、RMS、ピーク周波数、重心周波数、トリガ前ノイズ、`truncated` |
+| `/ae_features/activity` | `AeActivity` | `window_s`（既定 1 s）の窓でのヒット率、エネルギー率、カウント率、平均・最大ピーク振幅。`activity_period_s`（既定 0.1 s）ごと |
+
+- 特徴量は `threshold_v`（既定 0.02 V、ドライバの既定トリガレベルと同じ）を超えた区間で、トリガ前の平均を
+  引いた信号から計算する（定義は `analog_discovery/ae_features.py`）。
+- 振幅は AE9501B の出力での値で、ゲインを戻していない。ゲインの設定が同じ測定どうしでしか比べられない。
+- `truncated: true` は、ヒットが取り込み長より長かったことを示す。継続時間・エネルギーは下限値になる。
+  取り込みの終わりから 50 µs 以内に最後の交差があれば `truncated` とする（10 kHz の半周期まで）。
+- 取り込みの間の不感時間（約 12.5 ms）に起きたヒットは数えられない。ヒット率が高いときは過小評価になる。
+- 実機の AE（指でたたいた3回）: ピーク 0.38〜1.02 V、継続時間 2.0〜2.4 ms、カウント 81〜187、ピーク周波数 85 kHz。
+
+解析用に生データごと残すときは、`/analog_discovery/capture` を記録する（1回あたり約 128 kB/ch）。
+
+```bash
+ros2 bag record /analog_discovery/capture /ae_features/hit /ae_features/activity
+```
+
 ## 制約
 
 - **不感時間がある。** 取り込みを読み出してから再アームするので、読み出し中のトリガは取りこぼす。
