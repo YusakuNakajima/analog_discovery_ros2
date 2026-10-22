@@ -255,7 +255,7 @@ def test_poll_returns_nothing_until_done_then_the_capture():
     {'sample_rate_hz': 0.0},
     {'sample_rate_hz': 200e6},
     {'buffer_samples': 1},
-    {'pretrigger_samples': 8192},
+    {'pretrigger_samples': 32768},        # = buffer_samples
     {'trigger_source': 'ch3'},
     {'trigger_source': 'ch2', 'ch2_enabled': False},
     {'trigger_level_v': 2.5},             # at the +-2.5 V range edge

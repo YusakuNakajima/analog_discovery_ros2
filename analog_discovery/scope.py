@@ -29,16 +29,17 @@ DEFAULT_SETTLE_S = 0.2
 
 @dataclasses.dataclass
 class CaptureSettings:
-    sample_rate_hz: float = 1e6
-    buffer_samples: int = 8192
+    # Defaults match config/analog_discovery.yaml (AE9501B RF output; see there).
+    sample_rate_hz: float = 10e6
+    buffer_samples: int = 32768
     ch2_enabled: bool = True
     ch1_range_peak_v: float = 2.5  # +- V; AD3 has +-2.5 V and +-25 V
     ch2_range_peak_v: float = 2.5
     trigger_source: str = 'ch1'  # 'ch1' | 'ch2' | 'none' (free running, needs auto timeout)
     trigger_slope: str = 'rising'  # 'rising' | 'falling' | 'either'
-    trigger_level_v: float = 0.1
-    trigger_hysteresis_v: float = 0.01
-    pretrigger_samples: int = 1024  # samples before the trigger in each capture
+    trigger_level_v: float = 0.02
+    trigger_hysteresis_v: float = 0.005
+    pretrigger_samples: int = 4096  # samples before the trigger in each capture
     auto_timeout_s: float = 0.0  # 0: wait for a real trigger; > 0: capture anyway after this
 
     def validate(self):

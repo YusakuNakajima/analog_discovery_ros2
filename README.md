@@ -74,8 +74,19 @@ ros2 run rqt_plot rqt_plot /analog_discovery/ch1_peak_v/data
 
 ### パラメータ
 
-[config/analog_discovery.yaml](config/analog_discovery.yaml) を参照。既定値は立ち上げ用の暫定値
-（1 MS/s、8192 サンプル = 8.192 ms、うちトリガ前 1024 サンプル、ch1 立ち上がり 0.1 V、±2.5 V レンジ）。
+[config/analog_discovery.yaml](config/analog_discovery.yaml) を参照。既定値は NF AE9501B の RF 出力（AE、100 kHz〜2 MHz）を
+CH1 に入れる前提で、2026-10-22 に実機で取った波形から決めた（実験向けの調整はまだ）。
+
+| パラメータ | 既定値 | 根拠 |
+| --- | --- | --- |
+| `sample_rate_hz` | 10 MHz（立ち上げ時 1 MHz） | AE9501B の帯域上限 2 MHz の 5 倍 |
+| `buffer_samples` | 32768（同 8192） | AD3 の最大。残響が 2.46 ms を超えることが多かった |
+| `pretrigger_samples` | 4096 = 0.41 ms（同 1024） | トリガ後を 2.87 ms 残す |
+| `trigger_level_v` | 0.02 V（同 0.1 V） | 指でたたいたときのピークは 0.02〜1.16 V（中央値 0.50 V）、トリガ前のノイズは 1〜5 mV rms。90 秒で 379 回すべて取れた |
+| `trigger_hysteresis_v` | 0.005 V（同 0.01 V） | レベルの 1/4（上の取り込みで使った値） |
+
+10 MS/s・32768 サンプル・ch1 のみで、取り込み1回の周期（アーム→取り込み→読み出し）は約 12.5 ms。
+これが不感時間の目安（ch2 も有効だと読み出しが増える）。残響をもっと長く取りたいときは 5 MS/s で 6.6 ms。
 
 - `chN_range_peak_v` は ±V。AD3 は ±2.5 V と ±25 V（SDK には peak-to-peak の 5 V / 50 V で渡す）。
   デバイスが要求より狭いレンジを選んだときは起動を止める。
