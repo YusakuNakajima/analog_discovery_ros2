@@ -1,8 +1,9 @@
 # One triggered capture from an Analog Discovery oscilloscope input.
 #
 # header.stamp is the estimated host time of the trigger sample
-# (ch*_v[trigger_index]): the host clock when the finished capture was seen,
-# minus the post-trigger duration. Good to about one poll period. Use the
+# (ch*_v[trigger_index]): the host clock when the device was first seen done
+# (before the data is read out), minus the post-trigger duration. Late by up to
+# one poll period plus USB and scheduling latency. Use the
 # device_* fields for precise spacing between captures (AD3: device counter,
 # 10 ns at 100 MHz; AD2: host time).
 std_msgs/Header header

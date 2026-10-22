@@ -8,6 +8,7 @@ analog_discovery:
     config_index: -1         # -1 = device configuration with the largest scope buffer (AD3: 32768)
     frame_id: analog_discovery
     poll_period_s: 0.005     # s, how often the device is asked whether a capture is done
+    settle_s: 0.2            # s, wait after configuring before the first capture (README)
 
     sample_rate_hz: 1000000.0  # Hz per channel (AD3 up to 125 MHz)
     buffer_samples: 8192       # samples per channel per capture (8.192 ms at 1 MHz)

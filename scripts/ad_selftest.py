@@ -98,13 +98,17 @@ def main():
                         'loopback: triggered on the W1 square wave')
             if capture is not None:
                 v = capture.ch1_v
-                crossing = int(np.argmax((v[1:] > 0.0) & (v[:-1] <= 0.0))) + 1
+                # The 1 kHz wave rises every 1000 samples, so take the crossing
+                # nearest to the requested position, not the first one.
+                crossings = np.nonzero((v[1:] > 0.0) & (v[:-1] <= 0.0))[0] + 1
+                crossing = (int(crossings[np.argmin(np.abs(crossings - pre))])
+                            if len(crossings) else -1)
                 ok &= check(capture.trigger_index == pre,
                             f'loopback: reported trigger_index {capture.trigger_index} '
                             f'(requested {pre})')
                 ok &= check(abs(crossing - pre) <= 3,
-                            f'loopback: first rising crossing at sample {crossing} '
-                            f'(expected {pre})')
+                            f'loopback: rising crossing nearest the trigger at sample '
+                            f'{crossing} (expected {pre})')
                 ok &= check(0.4 < v.max() < 0.6 and -0.6 < v.min() < -0.4,
                             f'loopback: CH1 {v.min():+.3f}..{v.max():+.3f} V '
                             f'(W1 +-{SQUARE_AMPLITUDE_V} V)')

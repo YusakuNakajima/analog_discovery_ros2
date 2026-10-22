@@ -10,12 +10,21 @@ converted here from the +-peak value the user gives.
 
 import ctypes
 import dataclasses
+import math
+import time
 
 import numpy as np
 
 from analog_discovery import dwf as d
 
 MAX_SAMPLE_RATE_HZ = 125e6  # AD3 (AD2: 100 MS/s)
+# Wait after configure() before the first arm. On the AD3 at OnoLab (2026-10-22,
+# nothing on CH1, +-2.5 V range, ch1 rising 0.05 V) the first configure+arm after
+# opening the device triggered on a transient 47-64 ms after arming (0.043-0.072 V)
+# in 3 of the 4 processes where it was looked at; later configures did not. With
+# a 0.2 s wait: 0 of 8 (first cycle included). Provisional: about 3x the longest
+# transient seen.
+DEFAULT_SETTLE_S = 0.2
 
 
 @dataclasses.dataclass
@@ -34,6 +43,10 @@ class CaptureSettings:
 
     def validate(self):
         """Check what can be checked without the device; raise ValueError."""
+        for name in ('sample_rate_hz', 'ch1_range_peak_v', 'ch2_range_peak_v',
+                     'trigger_level_v', 'trigger_hysteresis_v', 'auto_timeout_s'):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f'{name} must be finite')
         if not 0.0 < self.sample_rate_hz <= MAX_SAMPLE_RATE_HZ:
             raise ValueError(f'sample_rate_hz must be in (0, {MAX_SAMPLE_RATE_HZ:g}]')
         if self.buffer_samples < 2:
@@ -81,6 +94,7 @@ class Capture:
     ch1_v: np.ndarray
     ch2_v: np.ndarray  # empty when ch2 is disabled
     device_time: tuple  # (secUtc, tick, ticksPerSecond) from FDwfAnalogInStatusTime
+    done_time: object = None  # value of poll(now=...) taken when Done was seen, before read-out
 
 
 def _int(v=0):
@@ -185,8 +199,10 @@ class AnalogDiscoveryScope:
 
     # --- acquisition ---
 
-    def configure(self, settings):
-        """Apply settings; return the sample rate the device actually uses (Hz)."""
+    def configure(self, settings, settle_s=DEFAULT_SETTLE_S):
+        """Apply settings, wait settle_s, return the sample rate the device uses (Hz)."""
+        if not (math.isfinite(settle_s) and settle_s >= 0.0):
+            raise ValueError('settle_s must be a finite, non-negative number')
         settings.validate()
         if settings.buffer_samples > self.max_buffer_samples:
             raise ValueError(f'buffer_samples {settings.buffer_samples} exceeds the '
@@ -233,19 +249,27 @@ class AnalogDiscoveryScope:
         applied = dataclasses.replace(settings, sample_rate_hz=rate.value)
         call('FDwfAnalogInTriggerPositionSet', h, ctypes.c_double(applied.trigger_position_s()))
         self.settings = applied
+        time.sleep(settle_s)  # let the input transient after reconfiguring die out
         return rate.value
 
     def arm(self):
         """Start (or restart) one acquisition."""
         self.dwf.call('FDwfAnalogInConfigure', self._hdwf, _int(1), _int(1))
 
-    def poll(self):
-        """Return a Capture once the acquisition is done, else None."""
+    def poll(self, now=None):
+        """Return a Capture once the acquisition is done, else None.
+
+        Completion is checked without transferring data, and now() (if given)
+        is called right then, before the read-out (4.5 ms for 2 x 8192 samples
+        on the AD3), so done_time is not delayed by the USB transfer.
+        """
         h, call, s = self._hdwf, self.dwf.call, self.settings
         state = ctypes.c_ubyte()
-        call('FDwfAnalogInStatus', h, _int(1), ctypes.pointer(state))
+        call('FDwfAnalogInStatus', h, _int(0), ctypes.pointer(state))
         if state.value != d.STATE_DONE:
             return None
+        done_time = now() if now is not None else None
+        call('FDwfAnalogInStatus', h, _int(1), ctypes.pointer(state))  # transfers the data
         data = []
         for ch, enabled in ((0, True), (1, s.ch2_enabled)):
             if not enabled:
@@ -266,4 +290,4 @@ class AnalogDiscoveryScope:
         return Capture(sample_rate_hz=s.sample_rate_hz,
                        trigger_index=min(max(index, 0), s.buffer_samples - 1),
                        auto_triggered=bool(auto.value), ch1_v=data[0], ch2_v=data[1],
-                       device_time=(sec.value, tick.value, tps.value))
+                       device_time=(sec.value, tick.value, tps.value), done_time=done_time)

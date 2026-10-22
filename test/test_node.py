@@ -37,6 +37,8 @@ def with_params(monkeypatch, **params):
     {'trigger_source': 'none'},
     {'poll_period_s': 0.0},
     {'sample_rate_hz': -1.0},
+    {'settle_s': -0.1},
+    {'poll_period_s': float('nan')},
 ])
 def test_bad_settings_are_rejected_before_open(mod, monkeypatch, params):
     opened = []
@@ -48,7 +50,7 @@ def test_bad_settings_are_rejected_before_open(mod, monkeypatch, params):
 
 
 def test_mock_node_starts_and_closes(mod, monkeypatch):
-    with_params(monkeypatch)
+    with_params(monkeypatch, settle_s=0.0)
     node = mod.AnalogDiscoveryNode()
     assert node.sample_rate_hz == 1e6
     node.shutdown()

@@ -161,7 +161,7 @@ def test_open_with_an_explicit_config():
 def configured(settings=None, lib=None):
     scope, lib = make(lib)
     scope.open()
-    rate = scope.configure(settings or CaptureSettings())
+    rate = scope.configure(settings or CaptureSettings(), settle_s=0.0)
     return scope, lib, rate
 
 
@@ -211,6 +211,32 @@ def test_a_failing_call_raises_with_the_sdk_message():
         configured(lib=lib)
 
 
+def test_done_time_is_taken_before_the_data_transfer():
+    scope, lib, _ = configured(CaptureSettings(buffer_samples=100, pretrigger_samples=30))
+    scope.arm()
+    lib.state = d.STATE_DONE
+
+    def now():
+        lib.calls.append(('now', []))
+        return 'T'
+
+    cap = scope.poll(now=now)
+    names = [n for n, _ in lib.calls]
+    status = [i for i, n in enumerate(names) if n == 'FDwfAnalogInStatus']
+    # status without data -> now() -> status with data -> data copies
+    assert [lib.calls[i][1][1] for i in status[-2:]] == [0, 1]
+    assert status[-2] < names.index('now') < status[-1] < names.index('FDwfAnalogInStatusData')
+    assert cap.done_time == 'T'
+
+
+def test_configure_rejects_a_bad_settle_time():
+    scope, _ = make()
+    scope.open()
+    for bad in (-1.0, float('nan')):
+        with pytest.raises(ValueError):
+            scope.configure(CaptureSettings(), settle_s=bad)
+
+
 def test_poll_returns_nothing_until_done_then_the_capture():
     s = CaptureSettings(buffer_samples=100, pretrigger_samples=30)
     scope, lib, _ = configured(s)
@@ -238,6 +264,10 @@ def test_poll_returns_nothing_until_done_then_the_capture():
     {'auto_timeout_s': -1.0},
     {'trigger_source': 'none'},           # free running without auto timeout
     {'ch1_range_peak_v': 0.0},
+    {'trigger_level_v': float('nan')},
+    {'trigger_hysteresis_v': float('nan')},
+    {'auto_timeout_s': float('nan')},
+    {'sample_rate_hz': float('inf')},
 ])
 def test_settings_validation(kwargs):
     with pytest.raises(ValueError):
