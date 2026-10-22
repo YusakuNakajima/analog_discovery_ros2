@@ -121,8 +121,10 @@ class AnalogDiscoveryScope:
             dwf.call('FDwfEnumDeviceIsOpened', _int(i), ctypes.pointer(used))
             sn = ctypes.create_string_buffer(32)
             dwf.call('FDwfEnumSN', _int(i), sn)
+            # The SDK reports 'SN:210415BF81F3'; keep the bare serial that lsusb shows.
+            serial = sn.value.decode().removeprefix('SN:')
             devices.append({'index': i, 'name': d.DEVICE_NAMES[devid.value],
-                            'serial': sn.value.decode(), 'in_use': bool(used.value)})
+                            'serial': serial, 'in_use': bool(used.value)})
         return devices
 
     def _config_buffers(self, index):
@@ -161,6 +163,13 @@ class AnalogDiscoveryScope:
         self.device_name = f'{dev["name"]} {dev["serial"]} (config {cfg})'
         self.serial = dev['serial']
         self.max_buffer_samples = sizes[cfg]
+        # The open succeeds even when the analog circuit stays off (seen with an
+        # AD3 behind two USB 2.0 hubs: it needs 600 mA); acquisitions then never
+        # start. The SDK only reports this in the last error message.
+        message = self.dwf.last_error()
+        if 'turned off' in message:
+            self.close()
+            raise d.DwfError(f'{self.device_name}: {message}')
 
     def close(self):
         if self._hdwf.value != d.HDWF_NONE:

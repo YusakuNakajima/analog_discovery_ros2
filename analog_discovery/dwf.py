@@ -68,12 +68,12 @@ class Dwf:
 
     def call(self, name, *args):
         if not getattr(self.lib, name)(*args):
-            raise DwfError(f'{name} failed: {self.last_error()}')
+            raise DwfError(f'{name} failed: {self.last_error() or "no message"}')
 
     def last_error(self):
         buf = ctypes.create_string_buffer(512)
         self.lib.FDwfGetLastErrorMsg(buf)
-        return buf.value.decode(errors='replace').strip() or 'no message'
+        return buf.value.decode(errors='replace').strip()
 
     def version(self):
         buf = ctypes.create_string_buffer(32)

@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 # Digilent packages are downloaded by hand; never commit them
 *.deb
+# written by the WaveForms SDK into the working directory
+DebugErc.log
