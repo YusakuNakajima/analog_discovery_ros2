@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Digilent packages are downloaded by hand; never commit them
+*.deb

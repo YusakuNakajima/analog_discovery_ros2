@@ -1,0 +1,106 @@
+# analog_discovery_ros2
+
+Digilent Analog Discovery 3（AD3）のオシロスコープ入力（2ch、14bit、最大 125 MS/s）を、
+**トリガ取り込み**で ROS 2 Humble に流すドライバ。インパルスのような短い現象を、前後を含めて
+高速に1波形ずつ取る用途向け。Digilent WaveForms SDK（`libdwf`）を ctypes で呼ぶ。AD2 でも動く想定（未確認）。
+
+## 現状
+
+| 項目 | 状態 |
+| --- | --- |
+| SDK 呼び出し・トリガ取り込み・ノード・メッセージ | 実装済み。偽の libdwf を使うテストと、mock（模擬インパルス）での通しの動作を確認済み |
+| AD3 実機 | **未確認**（2026-10-22 時点。USB では `1443:7003` として見えることだけ確認） |
+| トリガ位置の向き | **未確認。** SDK の `TriggerPositionSet` は「0 = バッファ中央、正 = トリガが先頭側へ」と仮定している。`ad_selftest.py --loopback` で確かめる |
+
+## セットアップ
+
+### 1. ホスト（初回のみ。コンテナの外で）
+
+```bash
+./udev/setup_udev.sh     # VID 1443 を 0666 にする。sudo のパスワードを聞かれる。最後に OK と出れば完了
+```
+
+Digilent の Adept Runtime も udev ルールを入れるが、それはコンテナの中に入るだけで、udev が動くホストでは効かない。
+
+### 2. WaveForms と Adept Runtime を落とす（ブラウザで）
+
+files.digilent.com は Cloudflare の確認があり、curl / wget では取れない。ブラウザで次の2つ
+（Linux、Ubuntu、x86_64 の `.deb`）を `~/onolab_ros2/depends/digilent/` に保存する（`depends/` は git の対象外）。
+
+- Adept 2 Runtime: <https://digilent.com/reference/software/adept/runtime>（確認済みの版: 2.30.1）
+- WaveForms: <https://digilent.com/reference/software/waveforms/waveforms-3/start>（確認済みの版: 3.25.1）
+
+### 3. コンテナ内
+
+```bash
+cd ~/onolab_ros2/ros2_ws/src/third_party/analog_discovery_ros2
+./scripts/install_waveforms.sh        # sha256 を確認してから apt で入れる（既知の版以外は --no-verify が必要）
+cd ~/onolab_ros2/ros2_ws
+colcon build --symlink-install --packages-select analog_discovery_ros2
+source install/setup.bash
+```
+
+コンテナを作り直すと WaveForms は消えるので、`install_waveforms.sh` をもう一度実行する。
+コンテナは `privileged: true`（`docker/compose.yaml` の設定）で起動している必要がある。
+
+## 使い方
+
+```bash
+ros2 run analog_discovery_ros2 ad_probe.py          # 接続中のデバイスとバッファサイズ（開かない）
+ros2 run analog_discovery_ros2 ad_selftest.py       # 1回の取り込み（出力には触らない）
+ros2 launch analog_discovery_ros2 analog_discovery.launch.py
+ros2 launch analog_discovery_ros2 analog_discovery.launch.py backend:=mock   # 実機なし
+```
+
+別のターミナルで:
+
+```bash
+ros2 topic echo --no-arr /analog_discovery/capture
+ros2 run rqt_plot rqt_plot /analog_discovery/ch1_peak_v/data
+```
+
+### トピック
+
+| トピック | 型 | 内容 |
+| --- | --- | --- |
+| `~/capture` | `analog_discovery_ros2/msg/ScopeCapture` | 1回のトリガ取り込み。`ch1_v` / `ch2_v` は電圧 [V]、`trigger_index` がトリガのサンプル |
+| `~/ch1_peak_v`, `~/ch2_peak_v` | `std_msgs/Float32` | 取り込みごとの、絶対値が最大のサンプル（符号付き、V）。rqt_plot 向け |
+
+- `header.stamp` はトリガ時刻の推定。ホストの時計で「取り込み完了を見た時刻 − トリガ後の長さ」なので、
+  約1ポーリング周期（既定 5 ms）の誤差がある。取り込み間の正確な間隔は `device_trigger_*`
+  （AD3 ではデバイスのカウンタ、10 ns）を使う。
+- `auto_triggered: true` は、トリガが来ないまま `auto_timeout_s` が過ぎて取った波形で、イベントではない。
+
+### パラメータ
+
+[config/analog_discovery.yaml](config/analog_discovery.yaml) を参照。既定値は立ち上げ用の暫定値
+（1 MS/s、8192 サンプル = 8.192 ms、うちトリガ前 1024 サンプル、ch1 立ち上がり 0.1 V、±2.5 V レンジ）。
+
+- `chN_range_peak_v` は ±V。AD3 は ±2.5 V と ±25 V（SDK には peak-to-peak の 5 V / 50 V で渡す）。
+  デバイスが要求より狭いレンジを選んだときは起動を止める。
+- `trigger_level_v` がレンジの外なら、デバイスを開く前にエラーにする（丸めない）。
+- 設定はすべてデバイスを開く前に検証する。SDK の呼び出しが失敗したら、ノードは終了する。
+
+## 制約
+
+- **不感時間がある。** 取り込みを読み出してから再アームするので、読み出し中のトリガは取りこぼす。
+  間隔の短いイベントが続く用途には向かない（その場合は Record モードの連続記録が必要。未実装）。
+- 1回の取り込みは最大 32 Ki サンプル/ch（AD3 の構成 2。`config_index: -1` で自動的に選ぶ）。
+- 入力は 1 MΩ‖24 pF、±50 V まで保護（データシート）。BNC Adapter Board 経由ではシングルエンド測定になる。
+  W1 / W2 の BNC は波形発生器の出力なので、信号を入れない。
+
+## 自己診断
+
+```bash
+ros2 run analog_discovery_ros2 ad_selftest.py --loopback
+```
+
+W1 → CH1 を BNC ケーブルでつなぎ、**それ以外は何もつながない**状態で実行する。W1 から 1 kHz・±0.5 V の
+矩形波を出し、立ち上がりエッジが `pretrigger_samples` の位置に来るかを調べる（トリガ位置の向きの確認）。
+
+## 出典
+
+- WaveForms SDK Reference Manual（dwfsdk.pdf、2025-04-08 改訂）: 関数と定数
+- Analog Discovery 3 Reference Manual / データシート: 入力仕様、バッファサイズ
+- パッケージの sha256: Arch AUR の PKGBUILD（digilent.adept.runtime 2.30.1、digilent.waveforms 3.25.1、2026-10-22 に参照）
+- USB ID: OnoLab の実機で `lsusb`（2026-10-22）

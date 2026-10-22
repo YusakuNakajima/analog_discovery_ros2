@@ -1,0 +1,6 @@
+# Digilent Analog Discovery 3 (VID 1443; seen as 1443:7003 at OnoLab, 2026-10-22).
+# Lets non-root users open it through libusb/WaveForms. World-writable on purpose:
+# the container user (ros) shares no group with the host. Same mode as Digilent's
+# own 52-digilent-usb.rules, which lives inside the container and never runs there.
+# Install on the host with ./setup_udev.sh.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1443", MODE="0666"
