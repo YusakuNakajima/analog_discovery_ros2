@@ -12,12 +12,13 @@ data it cannot vouch for.
 """
 
 import array
+import math
 import signal
 
 import numpy as np
 import rclpy
 from analog_discovery.dwf import DwfError
-from analog_discovery.scope import AnalogDiscoveryScope, CaptureSettings
+from analog_discovery.scope import AnalogDiscoveryScope, CaptureSettings, DEFAULT_SETTLE_S
 from analog_discovery_ros2.msg import ScopeCapture
 from rclpy.node import Node
 from std_msgs.msg import Float32
@@ -47,14 +48,17 @@ class AnalogDiscoveryNode(Node):
         config_index = p('config_index', -1).value  # -1 = largest scope buffer
         self.frame_id = p('frame_id', 'analog_discovery').value
         self.poll_period_s = p('poll_period_s', 0.005).value
+        self.settle_s = p('settle_s', DEFAULT_SETTLE_S).value  # s, wait after configuring
         defaults = CaptureSettings()
         self.settings = CaptureSettings(**{
             field: p(field, getattr(defaults, field)).value
             for field in CaptureSettings.__dataclass_fields__})
         # Checked before the device is opened.
         self.settings.validate()
-        if not self.poll_period_s > 0.0:
+        if not (math.isfinite(self.poll_period_s) and self.poll_period_s > 0.0):
             raise ValueError('poll_period_s must be positive')
+        if not (math.isfinite(self.settle_s) and self.settle_s >= 0.0):
+            raise ValueError('settle_s must not be negative')
 
         self.pub = self.create_publisher(ScopeCapture, '~/capture', 10)
         self.peak_pubs = (self.create_publisher(Float32, '~/ch1_peak_v', 10),
@@ -63,7 +67,7 @@ class AnalogDiscoveryNode(Node):
         self.scope = create_scope(backend, serial, config_index)
         self.scope.open()
         try:
-            self.sample_rate_hz = self.scope.configure(self.settings)
+            self.sample_rate_hz = self.scope.configure(self.settings, self.settle_s)
             self.scope.arm()
             self.timer = self.create_timer(self.poll_period_s, self.poll)
         except BaseException:
@@ -77,12 +81,11 @@ class AnalogDiscoveryNode(Node):
             f'{s.trigger_level_v:g} V, {s.pretrigger_samples} pretrigger samples')
 
     def poll(self):
-        capture = self.scope.poll()
+        capture = self.scope.poll(now=self.get_clock().now)
         if capture is None:
             return
-        now = self.get_clock().now()
         self.scope.arm()  # re-arm first to shorten the dead time
-        self.publish(capture, now)
+        self.publish(capture, capture.done_time)
 
     def publish(self, capture, seen_time):
         msg = ScopeCapture()

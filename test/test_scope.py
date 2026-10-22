@@ -17,7 +17,7 @@ class FakeLib:
 
     def __init__(self, devices=None, buffers=(16384, 32768, 8192), range_pp_v=None):
         self.devices = devices or [
-            (d.DEVID_DISCOVERY3, '210415BF81F3', False),
+            (d.DEVID_DISCOVERY3, 'SN:210415BF81F3', False),  # as the SDK reports it
             (99, 'OTHERDEVICE0', False),
             (d.DEVID_DISCOVERY3, '210415BF0000', True),
         ]
@@ -46,8 +46,10 @@ class FakeLib:
             return 1
         return f
 
+    last_error = b''
+
     def _FDwfGetLastErrorMsg(self, buf):
-        buf.value = b'fake failure'
+        buf.value = b'fake failure' if self.calls[-2][0] in self.fail else self.last_error
 
     def _FDwfEnum(self, _filter, count):
         count.contents.value = len(self.devices)
@@ -137,6 +139,16 @@ def test_open_refuses_a_unit_in_use_and_unknown_serials():
         scope.open()
 
 
+def test_open_fails_when_the_analog_circuit_is_off():
+    lib = FakeLib()
+    lib.last_error = (b'The analog circuit of the device is turned off.\n'
+                      b'The device needs at least 3W/600mA.')
+    scope, _ = make(lib)
+    with pytest.raises(d.DwfError, match='turned off'):
+        scope.open()
+    assert calls_named(lib, 'FDwfDeviceClose')  # not left open
+
+
 def test_open_with_an_explicit_config():
     scope, lib = make(config_index=2)
     scope.open()
@@ -149,7 +161,7 @@ def test_open_with_an_explicit_config():
 def configured(settings=None, lib=None):
     scope, lib = make(lib)
     scope.open()
-    rate = scope.configure(settings or CaptureSettings())
+    rate = scope.configure(settings or CaptureSettings(), settle_s=0.0)
     return scope, lib, rate
 
 
@@ -199,6 +211,32 @@ def test_a_failing_call_raises_with_the_sdk_message():
         configured(lib=lib)
 
 
+def test_done_time_is_taken_before_the_data_transfer():
+    scope, lib, _ = configured(CaptureSettings(buffer_samples=100, pretrigger_samples=30))
+    scope.arm()
+    lib.state = d.STATE_DONE
+
+    def now():
+        lib.calls.append(('now', []))
+        return 'T'
+
+    cap = scope.poll(now=now)
+    names = [n for n, _ in lib.calls]
+    status = [i for i, n in enumerate(names) if n == 'FDwfAnalogInStatus']
+    # status without data -> now() -> status with data -> data copies
+    assert [lib.calls[i][1][1] for i in status[-2:]] == [0, 1]
+    assert status[-2] < names.index('now') < status[-1] < names.index('FDwfAnalogInStatusData')
+    assert cap.done_time == 'T'
+
+
+def test_configure_rejects_a_bad_settle_time():
+    scope, _ = make()
+    scope.open()
+    for bad in (-1.0, float('nan')):
+        with pytest.raises(ValueError):
+            scope.configure(CaptureSettings(), settle_s=bad)
+
+
 def test_poll_returns_nothing_until_done_then_the_capture():
     s = CaptureSettings(buffer_samples=100, pretrigger_samples=30)
     scope, lib, _ = configured(s)
@@ -226,6 +264,10 @@ def test_poll_returns_nothing_until_done_then_the_capture():
     {'auto_timeout_s': -1.0},
     {'trigger_source': 'none'},           # free running without auto timeout
     {'ch1_range_peak_v': 0.0},
+    {'trigger_level_v': float('nan')},
+    {'trigger_hysteresis_v': float('nan')},
+    {'auto_timeout_s': float('nan')},
+    {'sample_rate_hz': float('inf')},
 ])
 def test_settings_validation(kwargs):
     with pytest.raises(ValueError):

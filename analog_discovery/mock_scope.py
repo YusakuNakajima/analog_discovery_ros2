@@ -37,7 +37,7 @@ class MockScope:
         self._is_open = False
         self._armed_at = None
 
-    def configure(self, settings):
+    def configure(self, settings, settle_s=0.0):
         settings.validate()
         if settings.buffer_samples > self.max_buffer_samples:
             raise ValueError(f'buffer_samples exceeds {self.max_buffer_samples}')
@@ -47,9 +47,10 @@ class MockScope:
     def arm(self):
         self._armed_at = self._clock()
 
-    def poll(self):
+    def poll(self, now=None):
         if self._armed_at is None or self._clock() - self._armed_at < self._period_s:
             return None
+        done_time = now() if now is not None else None
         self._armed_at = None
         s = self.settings
         n = np.arange(s.buffer_samples)
@@ -65,4 +66,4 @@ class MockScope:
                        auto_triggered=s.trigger_source == 'none',
                        ch1_v=noisy(pulse_v),
                        ch2_v=noisy(pulse_v / 2) if s.ch2_enabled else np.zeros(0),
-                       device_time=(0, 0, 0))
+                       device_time=(0, 0, 0), done_time=done_time)
