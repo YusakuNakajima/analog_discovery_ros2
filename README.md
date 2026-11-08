@@ -156,7 +156,7 @@ ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中
 
 - **保存した収録は、`~/confirm` されるまで有効ではない**（`.json` の `complete`: 欠落なく保存・計算できた、`confirmed`: 呼び出し側が確認した、
   `valid` = 両方）。CSV は保存時に `valid` False の行、確認時に同じ番号で `valid` True の行を足すので、解析では `valid` True の行（または
-  `valid: true` の `.json`）だけを使う。呼び出し側が失敗・中断・応答を失っても、その収録は後始末なしで無効のまま残る。
+  `valid: true` の `.json`）だけを使う。`.json` が正で、CSV はその記録（同じ番号は最後の行が有効）。呼び出し側が失敗・中断・応答を失っても、その収録は後始末なしで無効のまま残る。
 - ノードの終了時は、収録中なら中止し、保存中なら保存の終わりを待つ。
 - `frequency_threshold_hz` は 0 以上、サンプリング周波数の半分未満でないと起動しない（超えるビンが無いと値が常に 0 になる）。
 - 1回の収録: `<record_dir>/ae_<YYYYmmdd_HHMMSS>_<番号>.npy`（float32、V、CH1）と `.json`（サンプリング周波数、
@@ -164,7 +164,7 @@ ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中
 - 値（`ae_spectrum_integral`、V²）: 先頭 `skip_samples`（200012 = 0.1 s）を捨て、`rfft` の 100 kHz を超えるビンの
   `(|X|·2/N)²` の和。ROS 1 の `spectrum_integration`（`fft` + `fftfreq`）と同じ値になることを `test/test_ae_record.py` が確かめる。
   ROS 1 はADコードを ±1 V に換算していて、AD3 は入力端の電圧なので、ROS 1 の目標値（`target_ae_integral`）とは比べられない。
-- 既定（`config/ae_record.yaml`）: 2 MS/s（ROS 1 と同じ）、12 s（粉砕軌道 24 周 × 0.5 s）、±2.5 V。1回 96 MB。
+- 既定（`config/ae_record.yaml`）: 2 MS/s（ROS 1 と同じ）、14 s（粉砕軌道 24 周 × 0.5 s = 12 s ＋ 開始の遅れ 1 s ＋ 実行の遅れ 1 s）、±2.5 V。1回 112 MB。
   ROS 1 の収録長は Windows PC 側の設定で、リポジトリには残っていない。
 - 装置が上書きする前にホストが読めなかったサンプルは「欠落」（その位置は 0 V）として数える。**2 MS/s を欠落なく
   受け取れるかは実機で未確認**（偽の libdwf と mock でのみ確認）。`get` が欠落を報告したら、レートを下げるか、USB の

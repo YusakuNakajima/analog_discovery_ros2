@@ -333,7 +333,7 @@ class RecordSettings:
     """
 
     sample_rate_hz: float = 2e6  # ROS 1 AE recording: 5e-7 s per sample
-    duration_s: float = 12.0
+    duration_s: float = 14.0  # as config/ae_record.yaml
     ch1_range_peak_v: float = 2.5  # +- V; AD3 has +-2.5 V and +-25 V
 
     def validate(self):

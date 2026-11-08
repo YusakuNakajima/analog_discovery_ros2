@@ -532,3 +532,33 @@ def test_a_concurrent_confirm_waits_for_the_first_to_be_written(tmp_path, monkey
     t.join(5.0)
     t2.join(5.0)
     assert not first[0][0] and second[0][0] and second[0][1] == 'recording 1 confirmed'
+
+
+def test_a_failed_metadata_confirmation_is_logged_as_not_valid(tmp_path, monkeypatch):
+    rec, _, _ = mock_recorder(tmp_path)
+    rec.start()
+    ok, result = rec.get(5.0)
+    real = rec._write_meta
+    monkeypatch.setattr(rec, '_write_meta', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
+    assert not rec.confirm()[0]
+    rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
+    assert [(r['valid'], r['note'][:14]) for r in rows] == [
+        ('False', 'saved'), ('True', 'confirmed'), ('False', 'confirm failed')]  # last row wins
+    assert json.load(open(result.file[:-4] + '.json'))['valid'] is False
+    monkeypatch.setattr(rec, '_write_meta', real)
+    assert rec.confirm()[0]
+    assert json.load(open(result.file[:-4] + '.json'))['valid'] is True
+
+
+def test_a_stop_right_after_the_last_read_saves_nothing(tmp_path):
+    rec, scope, _ = mock_recorder(tmp_path)
+    real = scope.record
+
+    def record_then_stop(**kw):
+        rec_ = real(**kw)
+        rec._stop.set()  # stop() took the lock after the read loop, before the save
+        return rec_
+    scope.record = record_then_stop
+    ok, message = rec.start()
+    rec._thread.join()
+    assert os.listdir(tmp_path / 'ae') == []

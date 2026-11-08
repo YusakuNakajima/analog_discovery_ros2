@@ -41,7 +41,8 @@ CSV_FIELDS = ('index', 'start_wall_time', 'start_ros_time_s', 'file', 'sample_ra
               'frequency_threshold_hz', 'ae_spectrum_integral_v2', 'complete', 'confirmed', 'valid',
               'note')
 # A recording gets a row when it is saved (confirmed False, so valid False) and a second row
-# with the same index when the caller confirms it (valid True). Use only valid True rows.
+# with the same index when the caller confirms it (valid True); the last row of an index
+# wins. The .json is authoritative ("valid"), the CSV is a log of it.
 
 
 def spectrum_integral_v2(voltage_v, sample_rate_hz, skip_samples=ROS1_SKIP_SAMPLES,
@@ -218,12 +219,17 @@ class AeRecorder:
             if not result.complete:
                 return False, f'recording {result.index} is not complete ({result.error})'
             confirmed = dataclasses.replace(result, confirmed=True)
+            # The .json decides; it is written last. The CSV is a log (its last row of an
+            # index wins): a failed .json write is followed by a valid False row.
             try:
-                self._write_meta(result.file, {'confirmed': True, 'valid': True})
                 self._log_row(confirmed, note='confirmed')
             except Exception as e:
+                return False, f'recording {result.index}: confirmation not written ({e}); try again'
+            try:
+                self._write_meta(result.file, {'confirmed': True, 'valid': True})
+            except Exception as e:
                 try:
-                    self._write_meta(result.file, {'confirmed': False, 'valid': False})
+                    self._log_row(result, note=f'confirm failed: {e}')
                 except Exception:
                     pass
                 return False, f'recording {result.index}: confirmation not written ({e}); try again'
@@ -268,6 +274,11 @@ class AeRecorder:
             self._finish(RecordResult(index=index, file='', error=info['error']))
             return
         with self._lock:
+            if self._stop.is_set():  # stop came after the last read, before the save
+                info['error'] = f'recording {index} aborted'
+                started.set()
+                self.log(f'recording {index} aborted (nothing saved)')
+                return
             self._phase = 'saving'  # from here stop no longer aborts
         result = RecordResult(index=index, file='', sample_rate_hz=rec.sample_rate_hz,
                               num_samples=len(rec.ch1_v), lost_samples=rec.lost_samples,
