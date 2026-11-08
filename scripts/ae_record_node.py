@@ -9,13 +9,11 @@ Services (std_srvs/Trigger):
              false when samples were lost, the file could not be written, etc.
     ~/stop   abort a recording still being recorded (nothing saved) / drop an unread result;
              one already being saved is not aborted (the message says so).
-    ~/discard  make sure the latest recording is not used: abort it while it records
-             (nothing saved), else wait for its save and mark it not valid (.json
-             "discarded", a second CSV row with valid False), read by ~/get or not.
-             For a caller whose motion was aborted or did not line up. Retryable.
+    ~/confirm  confirm the recording last returned by ~/get (the caller's cycle went as
+             planned): only then its .json says valid true and a CSV row valid True is
+             added. Unconfirmed recordings stay on disk but are not valid. Retryable.
 Topic:
-    ~/ae_spectrum_integral_v2  std_msgs/Float64, after each saved recording (also invalid
-                               ones, as NaN), so that rosbag gets it too
+    ~/ae_spectrum_integral_v2  std_msgs/Float64, for each confirmed recording (rosbag)
 
 Each recording: <record_dir>/ae_<YYYYmmdd_HHMMSS>_<index>.npy (float32, V) and .json
 (rate, start time, lost samples, value). The device is opened at start-up and kept;
@@ -92,14 +90,15 @@ class AeRecordNode(Node):
         self.create_service(Trigger, '~/start', self._start, callback_group=group)
         self.create_service(Trigger, '~/get', self._get, callback_group=group)
         self.create_service(Trigger, '~/stop', self._stop, callback_group=group)
-        self.create_service(Trigger, '~/discard', self._discard, callback_group=group)
+        self.create_service(Trigger, '~/confirm', self._confirm, callback_group=group)
         self.get_logger().info(
             f'{self.scope.device_name}: CH1 +-{s.ch1_range_peak_v:g} V, {s.num_samples()} samples '
             f'at {s.sample_rate_hz:g} Hz ({s.duration_s:g} s) per recording -> {record_dir}'
             + (f', values -> {feature_log_csv}' if feature_log_csv else ''))
 
     def _on_result(self, result):
-        self.pub.publish(Float64(data=result.value_v2 if result.valid else math.nan))
+        if result.confirmed:
+            self.pub.publish(Float64(data=result.value_v2))
 
     def _start(self, _req, res):
         res.success, res.message = self.recorder.start(self.start_timeout_s)
@@ -125,18 +124,20 @@ class AeRecordNode(Node):
         self.get_logger().info(f'stop: {res.message}')
         return res
 
-    def _discard(self, _req, res):
-        res.success, res.message = self.recorder.discard(
-            'requested by the caller (the recording did not line up with the motion)',
-            timeout_s=self.scope.record_settings.duration_s + self.get_margin_s)
+    def _confirm(self, _req, res):
+        res.success, res.message = self.recorder.confirm()
         if res.success:
-            self.get_logger().warn(f'discard: {res.message}')
+            self.get_logger().info(f'confirm: {res.message}')
         else:
-            self.get_logger().error(f'discard: {res.message}')
+            self.get_logger().error(f'confirm: {res.message}')
         return res
 
     def shutdown(self):
-        self.recorder.stop()
+        # aborts a recording still being recorded; waits for one being saved
+        ok, message = self.recorder.stop(
+            timeout_s=self.scope.record_settings.duration_s + self.get_margin_s)
+        if not ok:
+            self.get_logger().error(f'shutdown: {message}; its files may be incomplete')
         self.scope.close()
 
 

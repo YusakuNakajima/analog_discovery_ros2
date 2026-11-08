@@ -217,7 +217,7 @@ def test_a_recording_is_saved_with_its_value(tmp_path):
     ok, message = rec.start()
     assert ok, message
     ok, result = rec.get(5.0)
-    assert ok and result.valid and not result.error
+    assert ok and result.complete and not result.confirmed and not result.error
     data = np.load(result.file)
     assert data.dtype == np.float32 and len(data) == 300000
     assert result.value_v2 == pytest.approx(spectrum_integral_v2(data, 1e6, 100000, 100e3))
@@ -228,7 +228,10 @@ def test_a_recording_is_saved_with_its_value(tmp_path):
     assert meta['feature']['value'] == result.value_v2
     assert meta['feature']['skip_samples'] == 100000
     rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
-    assert len(rows) == 1 and rows[0]['valid'] == 'True' and rows[0]['file'] == result.file
+    assert len(rows) == 1 and rows[0]['file'] == result.file
+    # saved but not valid until the caller confirms it
+    assert (rows[0]['complete'], rows[0]['confirmed'], rows[0]['valid']) == ('True', 'False', 'False')
+    assert meta['complete'] is True and meta['valid'] is False
     assert results == [result]
     assert 'ae_spectrum_integral=' in result.message()
 
@@ -248,10 +251,13 @@ def test_lost_samples_make_the_value_invalid_but_the_file_is_kept(tmp_path):
     rec, _, results = mock_recorder(tmp_path, lost=5)
     rec.start()
     ok, result = rec.get(5.0)
-    assert not ok and not result.valid and '5 samples lost' in result.error
+    assert not ok and not result.complete and '5 samples lost' in result.error
     assert os.path.exists(result.file)
     assert json.load(open(result.file[:-4] + '.json'))['lost_samples'] == 5
-    assert list(csv.DictReader(open(tmp_path / 'ae.csv')))[0]['valid'] == 'False'
+    assert list(csv.DictReader(open(tmp_path / 'ae.csv')))[0]['complete'] == 'False'
+    ok, message = rec.confirm()
+    assert not ok and 'not complete' in message
+    assert json.load(open(result.file[:-4] + '.json'))['valid'] is False
 
 
 def test_start_is_refused_while_recording_and_stop_aborts_without_saving(tmp_path):
@@ -399,55 +405,62 @@ def test_an_aborted_start_is_not_reported_as_started(tmp_path):
     assert not ok and 'aborted' in message
 
 
-def test_discard_marks_the_last_read_recording(tmp_path):
+def test_confirm_makes_the_last_read_recording_valid(tmp_path):
     rec, _, results = mock_recorder(tmp_path)
+    assert not rec.confirm()[0]  # nothing read yet
     rec.start()
     ok, result = rec.get(5.0)
     assert ok
-    ok, message = rec.discard('motion started late')
-    assert ok and 'discarded' in message
+    ok, message = rec.confirm()
+    assert ok and 'confirmed' in message
     meta = json.load(open(result.file[:-4] + '.json'))
-    assert meta['valid'] is False and meta['discarded'] == 'motion started late'
+    assert meta['confirmed'] is True and meta['valid'] is True
     rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
-    assert [(r['index'], r['valid']) for r in rows] == [('1', 'True'), ('1', 'False')]
-    assert rows[1]['note'] == 'discarded: motion started late'
-    assert results[-1].valid is False
-    ok, message = rec.discard('again')  # idempotent: no third CSV row
-    assert ok and 'already discarded' in message
+    assert [(r['index'], r['valid'], r['note']) for r in rows] == [
+        ('1', 'False', 'saved'), ('1', 'True', 'confirmed')]
+    assert results[-1].confirmed
+    ok, message = rec.confirm()  # idempotent: no third CSV row
+    assert ok and 'already confirmed' in message
     assert len(list(csv.DictReader(open(tmp_path / 'ae.csv')))) == 2
 
 
-def test_discard_aborts_a_running_recording(tmp_path):
-    rec, _, results = mock_recorder(tmp_path, realtime=True, duration_s=5.0)
-    assert rec.start()[0]
-    ok, message = rec.discard('motion aborted', timeout_s=5.0)
-    assert ok and 'aborted (nothing saved)' in message
-    assert os.listdir(tmp_path / 'ae') == [] and results == []
-
-
-def test_discard_of_an_unread_recording_and_without_any(tmp_path):
+def test_an_unread_or_unconfirmed_recording_stays_not_valid(tmp_path):
     rec, _, _ = mock_recorder(tmp_path)
-    assert not rec.discard('x')[0]  # nothing started yet
     rec.start()
-    ok, message = rec.discard('motion aborted', timeout_s=5.0)  # waits for the save
-    assert ok and 'discarded' in message
-    assert not rec.get(1.0)[0]  # the discarded result is not handed out any more
-    rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
-    assert [r['valid'] for r in rows] == ['True', 'False']
+    rec._thread.join()  # saved, never read (the caller failed or was stopped)
+    assert not rec.confirm()[0]
+    rec.start()  # the next cycle; the first one stays as it is
+    ok, second = rec.get(5.0)
+    assert ok and rec.confirm()[0]
+    metas = sorted(f for f in os.listdir(tmp_path / 'ae') if f.endswith('.json'))
+    valid = [json.load(open(tmp_path / 'ae' / f))['valid'] for f in metas]
+    assert valid == [False, True]
 
 
-def test_a_failed_discard_can_be_repeated(tmp_path, monkeypatch):
+def test_confirm_is_bound_to_the_recording_read_even_after_a_new_start(tmp_path):
+    rec, _, _ = mock_recorder(tmp_path)
+    rec.start()
+    ok, first = rec.get(5.0)
+    rec.start()
+    rec._thread.join()
+    assert rec.confirm()[0]
+    assert json.load(open(first.file[:-4] + '.json'))['valid'] is True
+    later = rec.get(5.0)[1]
+    assert json.load(open(later.file[:-4] + '.json'))['valid'] is False
+
+
+def test_a_failed_confirmation_can_be_repeated(tmp_path, monkeypatch):
     rec, _, _ = mock_recorder(tmp_path)
     rec.start()
     ok, result = rec.get(5.0)
-    real = rec._write_meta
-    monkeypatch.setattr(rec, '_write_meta', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
-    ok, message = rec.discard('late')
+    real = rec._log_row
+    monkeypatch.setattr(rec, '_log_row', lambda *a, **k: (_ for _ in ()).throw(OSError('disk full')))
+    ok, message = rec.confirm()
     assert not ok and 'disk full' in message and 'try again' in message
+    assert json.load(open(result.file[:-4] + '.json'))['valid'] is False  # rolled back
+    monkeypatch.setattr(rec, '_log_row', real)
+    assert rec.confirm()[0]
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is True
-    monkeypatch.setattr(rec, '_write_meta', real)
-    assert rec.discard('late')[0]
-    assert json.load(open(result.file[:-4] + '.json'))['valid'] is False
 
 
 def test_an_old_stop_does_not_drop_a_newer_result(tmp_path):
@@ -479,4 +492,5 @@ def test_a_failed_csv_row_leaves_the_metadata_not_valid(tmp_path):
     ok, result = rec.get(5.0)
     assert not ok and 'CSV row not written' in result.error and result.file
     meta = json.load(open(result.file[:-4] + '.json'))
-    assert meta['valid'] is False and any('CSV' in e for e in meta['errors'])
+    assert meta['complete'] is False and any('CSV' in e for e in meta['errors'])
+    assert not rec.confirm()[0]

@@ -142,6 +142,7 @@ ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/path/to/ae fe
 ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/tmp/ae backend:=mock   # 実機なし
 ros2 service call /ae_recorder/start std_srvs/srv/Trigger   # 装置からサンプルが届いたら返る
 ros2 service call /ae_recorder/get std_srvs/srv/Trigger     # 保存と計算を待って値を返す
+ros2 service call /ae_recorder/confirm std_srvs/srv/Trigger # その収録を有効にする
 ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中止（保存しない）
 ```
 
@@ -150,9 +151,13 @@ ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中
 | `~/start` | 収録を始める。収録中・保存中は断る。空き容量が1回分（＋200 MB）より少なければ断る |
 | `~/get` | 直前に始めた収録の保存・計算が終わるまで待ち（`duration_s` + `get_margin_s`）、`ae_spectrum_integral=... V^2 file=...` を返す。サンプルの欠落・保存の失敗があれば `success: false`。同じ収録は2回返さず、待っている間に次の `start` が来たら何も返さない |
 | `~/stop` | 収録中なら中止する（何も保存しない）。収録が終わって保存中なら中止せず、保存を待ってそう返す。読まれていない結果は捨てる（ファイルは残る） |
-| `~/discard` | 最後に始めた収録を使わせない: 収録中なら中止（保存しない）、そうでなければ保存を待って無効にする（`.json` に `discarded`・`valid: false`、CSV に同じ番号で `valid` False の行を追加）。`~/get` で読んだかどうかによらない。書き込みに失敗したら再実行できる。粉砕が失敗した・時間が合わなかったサイクル用 |
-| `~/ae_spectrum_integral_v2` | `std_msgs/Float64`。保存した収録ごと（無効な収録は NaN）。rosbag 用 |
+| `~/confirm` | 直前に `~/get` が返した収録を「有効」にする（`.json` の `confirmed`・`valid` を true に、CSV に同じ番号で `valid` True の行を追加）。呼び出し側のサイクルが予定どおり終わったときに呼ぶ。完全な収録だけ確認できる。書き込みに失敗したら再実行できる |
+| `~/ae_spectrum_integral_v2` | `std_msgs/Float64`。確認された収録ごと。rosbag 用 |
 
+- **保存した収録は、`~/confirm` されるまで有効ではない**（`.json` の `complete`: 欠落なく保存・計算できた、`confirmed`: 呼び出し側が確認した、
+  `valid` = 両方）。CSV は保存時に `valid` False の行、確認時に同じ番号で `valid` True の行を足すので、解析では `valid` True の行（または
+  `valid: true` の `.json`）だけを使う。呼び出し側が失敗・中断・応答を失っても、その収録は後始末なしで無効のまま残る。
+- ノードの終了時は、収録中なら中止し、保存中なら保存の終わりを待つ。
 - `frequency_threshold_hz` は 0 以上、サンプリング周波数の半分未満でないと起動しない（超えるビンが無いと値が常に 0 になる）。
 - 1回の収録: `<record_dir>/ae_<YYYYmmdd_HHMMSS>_<番号>.npy`（float32、V、CH1）と `.json`（サンプリング周波数、
   開始時刻（最初のサンプルがホストに届いた時刻。サンプル0はその数 ms 前。壁時計と ROS 時刻）、欠落サンプル数、レンジ、値と式のパラメータ）。`get` を呼ばなくても保存する。既存のファイルは上書きしない。

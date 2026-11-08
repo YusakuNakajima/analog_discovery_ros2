@@ -11,6 +11,9 @@ Here the AD3 records CH1 (the AE9501B RF output) itself in Record mode. AeRecord
 runs one recording at a time in a thread: start() returns once the device records,
 the recording is then saved (.npy of float32 V + .json metadata) and its ae_integral
 appended to a CSV, whether or not get() is called; get() waits for that and returns it.
+A saved recording is NOT valid until the caller confirm()s it (its cycle went as
+planned): any failure, interruption or lost answer on the caller's side leaves it
+unconfirmed, without the caller having to clean up.
 
 The value is NOT comparable with the ROS 1 targets: another ADC (ROS 1 mapped codes
 to +-1 V; the AD3 measures V at its input) and possibly another AE9501B gain.
@@ -35,8 +38,10 @@ ROS1_FREQUENCY_THRESHOLD_HZ = 100e3
 FREE_SPACE_MARGIN_BYTES = 200 * 1024 * 1024  # left free on the disk after a recording
 CSV_FIELDS = ('index', 'start_wall_time', 'start_ros_time_s', 'file', 'sample_rate_hz',
               'num_samples', 'lost_samples', 'corrupted_samples', 'skip_samples',
-              'frequency_threshold_hz', 'ae_spectrum_integral_v2', 'valid', 'note')
-# A discarded recording gets a second row with the same index, valid False and the reason.
+              'frequency_threshold_hz', 'ae_spectrum_integral_v2', 'complete', 'confirmed', 'valid',
+              'note')
+# A recording gets a row when it is saved (confirmed False, so valid False) and a second row
+# with the same index when the caller confirms it (valid True). Use only valid True rows.
 
 
 def spectrum_integral_v2(voltage_v, sample_rate_hz, skip_samples=ROS1_SKIP_SAMPLES,
@@ -69,11 +74,11 @@ class RecordResult:
     lost_samples: int = 0
     corrupted_samples: int = 0
     value_v2: float = float('nan')
-    valid: bool = False  # saved, complete (no lost / corrupted samples) and computed
+    complete: bool = False  # saved, no lost / corrupted samples, value computed
+    confirmed: bool = False  # the caller confirmed it matches what it measured (confirm())
     error: str = ''
     start_wall_time: str = ''
     start_ros_time_s: float = float('nan')
-    discarded: str = ''  # reason, once discard() has written it
 
     def message(self):
         text = (f'{FEATURE_NAME}={self.value_v2:.9g} {FEATURE_UNIT} index={self.index} '
@@ -115,7 +120,7 @@ class AeRecorder:
         self._stop = threading.Event()
         self._index = 0
         self._result = None  # RecordResult of the last finished recording, until get()
-        self._latest = None  # RecordResult of the latest finished recording (for discard)
+        self._last_read = None  # RecordResult last returned by get, until confirmed
         self._phase = 'idle'  # recording | saving (while the thread runs)
 
     # --- commands (thread-safe) ---
@@ -168,7 +173,8 @@ class AeRecorder:
                 return False, (f'no unread result of recording {index} '
                                '(already read, aborted, or replaced by a newer start)')
             self._result = None
-        return result.valid, result
+            self._last_read = result
+        return result.complete, result
 
     def stop(self, timeout_s=5.0):
         """Abort a recording still being recorded (nothing is saved). Returns (ok, message).
@@ -194,43 +200,34 @@ class AeRecorder:
         return True, (f'recording {index} had already finished and is saved '
                       f'({dropped.file or "not saved"}); its result is dropped')
 
-    def discard(self, reason, timeout_s=None):
-        """Make sure the latest started recording is not used: abort it while it records
-        (nothing saved), else wait for its save and mark it not valid in its .json and with
-        a second CSV row (valid False). Read by get or not. Returns (ok, message); on a
-        failed write the same recording can be discarded again.
+    def confirm(self):
+        """Confirm the recording last returned by get: the caller's cycle went as planned.
 
-        For a caller that finds the recording does not match what it measured (motion
-        aborted, started late).
+        Only a complete recording can be confirmed. Writes confirmed / valid true into its
+        .json and a second CSV row (valid True). Retryable when the write fails; a later
+        start does not change which recording this confirms. Returns (ok, message).
         """
         with self._lock:
-            thread, index, phase = self._thread, self._index, self._phase
-            if thread is not None and thread.is_alive() and phase == 'recording':
-                self._stop.set()
-        if thread is not None:
-            thread.join(timeout_s)
-            if thread.is_alive():
-                return False, f'recording {index} did not finish within {timeout_s} s'
-        with self._lock:
-            latest = self._latest
-            self._take_result(index)
-        if latest is None or latest.index != index:
-            if index == 0:
-                return False, 'no recording to discard'
-            return True, f'recording {index} aborted (nothing saved)'
-        if latest.discarded:
-            return True, f'recording {index} already discarded ({latest.discarded})'
-        if latest.file:
+            result = self._last_read
+        if result is None:
+            return False, 'no recording returned by get to confirm'
+        if result.confirmed:
+            return True, f'recording {result.index} already confirmed'
+        if not result.complete:
+            return False, f'recording {result.index} is not complete ({result.error})'
+        try:
+            self._write_meta(result.file, {'confirmed': True, 'valid': True})
+            result.confirmed = True
+            self._log_row(result, note='confirmed')
+        except Exception as e:
+            result.confirmed = False
             try:
-                self._write_meta(latest.file, {'discarded': reason, 'valid': False})
-                self._log_row(latest, valid=False, note=f'discarded: {reason}')
-            except Exception as e:
-                return False, f'recording {index}: discard not written ({e}); try again'
-        latest.discarded = reason
-        latest.valid = False
-        latest.error = '; '.join(filter(None, [latest.error, f'discarded: {reason}']))
-        self.on_result(latest)
-        return True, f'recording {index} discarded: {reason}'
+                self._write_meta(result.file, {'confirmed': False, 'valid': False})
+            except Exception:
+                pass
+            return False, f'recording {result.index}: confirmation not written ({e}); try again'
+        self.on_result(result)
+        return True, f'recording {result.index} confirmed'
 
     def _take_result(self, index):
         """Under the lock: drop and return the unread result if it is recording index's."""
@@ -286,19 +283,19 @@ class AeRecorder:
         result.start_ros_time_s = wall['ros_time_s']
         self._save(index, wall, rec, result, errors)
         result.error = '; '.join(errors)
-        result.valid = not errors
+        result.complete = not errors
         self._finish(result)
 
     def _finish(self, result):
         with self._lock:
             self._result = result
-            self._latest = result
         self.log(result.message())
         self.on_result(result)
 
     def _save(self, index, wall, rec, result, errors):
         """Write .npy, .json, the CSV row; failures go to errors, and the .json and the CSV
-        row always end with the final valid flag (a failed CSV row is noted in the .json)."""
+        row always end with the final complete flag (a failed CSV row is noted in the .json).
+        Saved recordings are not valid until confirm()."""
         stamp = wall['time'].strftime('%Y%m%d_%H%M%S')
         base = os.path.join(self.record_dir, f'ae_{stamp}_{index:04d}')
         npy = base + '.npy'
@@ -332,7 +329,9 @@ class AeRecorder:
                 'definition': 'ROS 1 analysis_ae.py spectrum_integration',
             },
             'errors': errors,
-            'valid': not errors,
+            'complete': not errors,
+            'confirmed': False,  # set by confirm(): the caller's cycle went as planned
+            'valid': False,  # = complete and confirmed; use only valid recordings
             **self.extra_metadata,
         }
         try:
@@ -341,11 +340,12 @@ class AeRecorder:
         except Exception as e:
             errors.append(f'metadata not saved: {e}')
         try:
-            self._log_row(result, valid=not errors)
+            result.complete = not errors
+            self._log_row(result, note='saved')
         except Exception as e:
             errors.append(f'CSV row not written: {e}')
             try:
-                self._write_meta(npy, {'errors': errors, 'valid': False})
+                self._write_meta(npy, {'errors': errors, 'complete': False})
             except Exception:
                 pass  # already reported through errors (get fails)
 
@@ -359,7 +359,7 @@ class AeRecorder:
             json.dump(meta, f, indent=1)
         os.replace(tmp, meta_path)
 
-    def _log_row(self, result, valid, note=''):
+    def _log_row(self, result, note=''):
         if not self.feature_log_csv:
             return
         log = self.feature_log_csv
@@ -371,4 +371,5 @@ class AeRecorder:
             writer.writerow([result.index, result.start_wall_time, result.start_ros_time_s, result.file,
                              result.sample_rate_hz, result.num_samples, result.lost_samples,
                              result.corrupted_samples, self.skip_samples,
-                             self.frequency_threshold_hz, result.value_v2, valid, note])
+                             self.frequency_threshold_hz, result.value_v2, result.complete,
+                             result.confirmed, result.complete and result.confirmed, note])
