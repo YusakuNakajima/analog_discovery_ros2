@@ -384,7 +384,8 @@ def _configure_record(scope, settings, settle_s):
     call('FDwfAnalogInFrequencyGet', h, ctypes.pointer(rate))
     # keep the number of samples asked for; the duration follows the device's rate
     applied = dataclasses.replace(settings, sample_rate_hz=rate.value,
-                                  duration_s=settings.num_samples() / rate.value)
+                                  duration_s=settings.num_samples() / rate.value,
+                                  ch1_range_peak_v=actual.value / 2)  # the range the device took
     call('FDwfAnalogInRecordLengthSet', h, ctypes.c_double(applied.duration_s))
     call('FDwfAnalogInTriggerSourceSet', h, ctypes.c_ubyte(d.TRIGSRC_NONE))
     call('FDwfAnalogInConfigure', h, _int(1), _int(0))  # apply without starting

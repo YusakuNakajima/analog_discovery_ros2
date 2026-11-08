@@ -116,6 +116,7 @@ class AeRecorder:
         self.on_result = on_result or (lambda result: None)  # called in the recording thread
         self.extra_metadata = dict(extra_metadata or {})
         self._lock = threading.Lock()
+        self._confirm_lock = threading.Lock()
         self._thread = None
         self._stop = threading.Event()
         self._index = 0
@@ -207,27 +208,28 @@ class AeRecorder:
         .json and a second CSV row (valid True). Retryable when the write fails; a later
         start does not change which recording this confirms. Returns (ok, message).
         """
-        with self._lock:
-            result = self._last_read
-        if result is None:
-            return False, 'no recording returned by get to confirm'
-        if result.confirmed:
-            return True, f'recording {result.index} already confirmed'
-        if not result.complete:
-            return False, f'recording {result.index} is not complete ({result.error})'
-        try:
-            self._write_meta(result.file, {'confirmed': True, 'valid': True})
-            result.confirmed = True
-            self._log_row(result, note='confirmed')
-        except Exception as e:
-            result.confirmed = False
+        with self._confirm_lock:  # one confirmation at a time, answered after it is written
+            with self._lock:
+                result = self._last_read
+            if result is None:
+                return False, 'no recording returned by get to confirm'
+            if result.confirmed:
+                return True, f'recording {result.index} already confirmed'
+            if not result.complete:
+                return False, f'recording {result.index} is not complete ({result.error})'
+            confirmed = dataclasses.replace(result, confirmed=True)
             try:
-                self._write_meta(result.file, {'confirmed': False, 'valid': False})
-            except Exception:
-                pass
-            return False, f'recording {result.index}: confirmation not written ({e}); try again'
-        self.on_result(result)
-        return True, f'recording {result.index} confirmed'
+                self._write_meta(result.file, {'confirmed': True, 'valid': True})
+                self._log_row(confirmed, note='confirmed')
+            except Exception as e:
+                try:
+                    self._write_meta(result.file, {'confirmed': False, 'valid': False})
+                except Exception:
+                    pass
+                return False, f'recording {result.index}: confirmation not written ({e}); try again'
+            result.confirmed = True  # only once both are written
+            self.on_result(result)
+            return True, f'recording {result.index} confirmed'
 
     def _take_result(self, index):
         """Under the lock: drop and return the unread result if it is recording index's."""

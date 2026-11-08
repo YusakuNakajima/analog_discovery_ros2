@@ -494,3 +494,41 @@ def test_a_failed_csv_row_leaves_the_metadata_not_valid(tmp_path):
     meta = json.load(open(result.file[:-4] + '.json'))
     assert meta['complete'] is False and any('CSV' in e for e in meta['errors'])
     assert not rec.confirm()[0]
+
+
+def test_configure_record_keeps_the_range_the_device_took():
+    lib = RecordLib([])
+    lib.range_pp_v = 50.0  # asked +-1 V, the device takes +-25 V
+    scope = AnalogDiscoveryScope(dwf=d.Dwf(lib))
+    scope.open()
+    scope.configure_record(RecordSettings(1000.0, 0.01, ch1_range_peak_v=1.0), settle_s=0.0)
+    assert scope.record_settings.ch1_range_peak_v == 25.0
+
+
+def test_a_concurrent_confirm_waits_for_the_first_to_be_written(tmp_path, monkeypatch):
+    rec, _, _ = mock_recorder(tmp_path)
+    rec.start()
+    rec.get(5.0)
+    writing = threading.Event()
+    release = threading.Event()
+    real = rec._log_row
+
+    def slow_then_fail(*a, **k):
+        writing.set()
+        release.wait(5.0)
+        raise OSError('disk full')
+    monkeypatch.setattr(rec, '_log_row', slow_then_fail)
+    first = []
+    t = threading.Thread(target=lambda: first.append(rec.confirm()))
+    t.start()
+    assert writing.wait(5.0)
+    second = []
+    t2 = threading.Thread(target=lambda: second.append(rec.confirm()))
+    t2.start()
+    time.sleep(0.1)
+    assert second == []  # not answered 'already confirmed' while the first is writing
+    monkeypatch.setattr(rec, '_log_row', real)
+    release.set()
+    t.join(5.0)
+    t2.join(5.0)
+    assert not first[0][0] and second[0][0] and second[0][1] == 'recording 1 confirmed'
