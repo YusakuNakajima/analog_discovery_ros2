@@ -85,7 +85,7 @@ class MockScope:
 
     def record(self, should_stop=None, now=None, poll_period_s=0.001, stall_timeout_s=None):
         s = self.record_settings
-        start_time = now() if now is not None else None
+        start_time = now() if now is not None else None  # as the first samples arrive
         end = self._clock() + (s.duration_s if self._realtime else 0.0)
         while self._clock() < end:
             if should_stop is not None and should_stop():

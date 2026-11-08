@@ -140,7 +140,7 @@ NAS に CSV を書き、`analysis_ae.py` が値を出していた）の置き換
 ```bash
 ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/path/to/ae feature_log_csv:=/path/to/ae.csv
 ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/tmp/ae backend:=mock   # 実機なし
-ros2 service call /ae_recorder/start std_srvs/srv/Trigger   # 収録を始めたら返る
+ros2 service call /ae_recorder/start std_srvs/srv/Trigger   # 装置からサンプルが届いたら返る
 ros2 service call /ae_recorder/get std_srvs/srv/Trigger     # 保存と計算を待って値を返す
 ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中止（保存しない）
 ```
@@ -148,12 +148,14 @@ ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中
 | サービス / トピック | 内容 |
 | --- | --- |
 | `~/start` | 収録を始める。収録中・保存中は断る。空き容量が1回分（＋200 MB）より少なければ断る |
-| `~/get` | 直前の収録の保存・計算が終わるまで待ち（`duration_s` + `get_margin_s`）、`ae_spectrum_integral=... V^2 file=...` を返す。サンプルの欠落・保存の失敗があれば `success: false`。同じ収録は2回返さない |
-| `~/stop` | 収録中なら中止する（何も保存しない）。読まれていない結果は捨てる（ファイルは残る） |
+| `~/get` | 直前に始めた収録の保存・計算が終わるまで待ち（`duration_s` + `get_margin_s`）、`ae_spectrum_integral=... V^2 file=...` を返す。サンプルの欠落・保存の失敗があれば `success: false`。同じ収録は2回返さず、待っている間に次の `start` が来たら何も返さない |
+| `~/stop` | 収録中なら中止する（何も保存しない）。収録が終わって保存中なら中止せず、保存を待ってそう返す。読まれていない結果は捨てる（ファイルは残る） |
+| `~/discard` | 直前に `~/get` が返した収録を無効にする（`.json` に `discarded`・`valid: false`、CSV に同じ番号で `valid` False の行を追加）。粉砕と時間が合わなかったサイクル用 |
 | `~/ae_spectrum_integral_v2` | `std_msgs/Float64`。保存した収録ごと（無効な収録は NaN）。rosbag 用 |
 
+- `frequency_threshold_hz` は 0 以上、サンプリング周波数の半分未満でないと起動しない（超えるビンが無いと値が常に 0 になる）。
 - 1回の収録: `<record_dir>/ae_<YYYYmmdd_HHMMSS>_<番号>.npy`（float32、V、CH1）と `.json`（サンプリング周波数、
-  開始時刻（壁時計と ROS 時刻）、欠落サンプル数、レンジ、値と式のパラメータ）。`get` を呼ばなくても保存する。既存のファイルは上書きしない。
+  開始時刻（最初のサンプルがホストに届いた時刻。サンプル0はその数 ms 前。壁時計と ROS 時刻）、欠落サンプル数、レンジ、値と式のパラメータ）。`get` を呼ばなくても保存する。既存のファイルは上書きしない。
 - 値（`ae_spectrum_integral`、V²）: 先頭 `skip_samples`（200012 = 0.1 s）を捨て、`rfft` の 100 kHz を超えるビンの
   `(|X|·2/N)²` の和。ROS 1 の `spectrum_integration`（`fft` + `fftfreq`）と同じ値になることを `test/test_ae_record.py` が確かめる。
   ROS 1 はADコードを ±1 V に換算していて、AD3 は入力端の電圧なので、ROS 1 の目標値（`target_ae_integral`）とは比べられない。

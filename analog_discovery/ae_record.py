@@ -35,7 +35,8 @@ ROS1_FREQUENCY_THRESHOLD_HZ = 100e3
 FREE_SPACE_MARGIN_BYTES = 200 * 1024 * 1024  # left free on the disk after a recording
 CSV_FIELDS = ('index', 'start_wall_time', 'start_ros_time_s', 'file', 'sample_rate_hz',
               'num_samples', 'lost_samples', 'corrupted_samples', 'skip_samples',
-              'frequency_threshold_hz', 'ae_spectrum_integral_v2', 'valid')
+              'frequency_threshold_hz', 'ae_spectrum_integral_v2', 'valid', 'note')
+# A discarded recording gets a second row with the same index, valid False and the reason.
 
 
 def spectrum_integral_v2(voltage_v, sample_rate_hz, skip_samples=ROS1_SKIP_SAMPLES,
@@ -94,6 +95,11 @@ class AeRecorder:
         self.frequency_threshold_hz = float(frequency_threshold_hz)
         if self.skip_samples < 0:
             raise ValueError('skip_samples must not be negative')
+        nyquist_hz = scope.record_settings.sample_rate_hz / 2
+        if not 0.0 <= self.frequency_threshold_hz < nyquist_hz:  # NaN fails too
+            raise ValueError(f'frequency_threshold_hz {self.frequency_threshold_hz} must be in '
+                             f'[0, {nyquist_hz:g}) (half the sample rate): no FFT bin above it '
+                             'would make every value 0')
         if self.skip_samples + 2 > scope.record_settings.num_samples():
             raise ValueError(f'skip_samples {self.skip_samples} leaves less than 2 of the '
                              f'{scope.record_settings.num_samples()} recorded samples')
@@ -106,14 +112,16 @@ class AeRecorder:
         self._stop = threading.Event()
         self._index = 0
         self._result = None  # RecordResult of the last finished recording, until get()
+        self._last_read = None  # RecordResult last returned by get (for discard)
+        self._phase = 'idle'  # recording | saving (while the thread runs)
 
     # --- commands (thread-safe) ---
 
     def start(self, timeout_s=2.0):
-        """Start a recording; return (ok, message) once the device records."""
+        """Start a recording; return (ok, message) once samples arrive from the device."""
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
-                return False, 'a recording is still running (or being saved)'
+                return False, f'recording {self._index} is still {self._phase}'
             if self._result is not None:
                 self.log(f'recording {self._result.index} was not read with get '
                          f'(saved: {self._result.file or "no"})')
@@ -124,47 +132,95 @@ class AeRecorder:
                 return False, (f'{free / 1e9:.2f} GB free in {self.record_dir}, a recording '
                                f'needs {needed / 1e9:.2f} GB')
             self._index += 1
+            index = self._index
             self._stop.clear()
+            self._phase = 'recording'
             started = threading.Event()
             info = {}
-            self._thread = threading.Thread(target=self._run, args=(self._index, started, info),
+            self._thread = threading.Thread(target=self._run, args=(index, started, info),
                                             daemon=True)
             self._thread.start()
         if not started.wait(timeout_s):
-            self._stop.set()
-            return False, f'the device did not start recording within {timeout_s} s'
+            self._stop.set()  # a recording that starts later is aborted, not saved
+            return False, f'no samples from the device within {timeout_s} s'
         if 'error' in info:
             return False, info['error']
-        return True, f'recording {self._index} started ({self._describe()})'
+        return True, f'recording {index} started ({self._describe()})'
 
     def get(self, timeout_s):
-        """Wait for the last recording to be saved; return (ok, RecordResult or message)."""
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout_s)
-            if thread.is_alive():
-                return False, f'recording not finished within {timeout_s} s'
+        """Wait until the last started recording is saved; return (ok, RecordResult or message).
+
+        Bound to that recording: if another start replaced it meanwhile, nothing is returned.
+        """
         with self._lock:
-            result, self._result = self._result, None
-        if result is None:
-            return False, 'no new recording since the last get (start first)'
+            thread, index = self._thread, self._index
+        if thread is None:
+            return False, 'no recording (start first)'
+        thread.join(timeout_s)
+        if thread.is_alive():
+            return False, f'recording {index} not finished within {timeout_s} s'
+        with self._lock:
+            result = self._result
+            if result is None or result.index != index:
+                return False, (f'no unread result of recording {index} '
+                               '(already read, aborted, or replaced by a newer start)')
+            self._result = None
+            self._last_read = result
         return result.valid, result
 
     def stop(self, timeout_s=5.0):
-        """Abort a running recording (it is not saved). Returns (ok, message)."""
-        thread = self._thread
-        if thread is None or not thread.is_alive():
-            with self._lock:
+        """Abort a recording still being recorded (nothing is saved). Returns (ok, message).
+
+        A recording already being saved is not aborted: stop waits for it and says so.
+        """
+        with self._lock:
+            thread, index, phase = self._thread, self._index, self._phase
+            if thread is None or not thread.is_alive():
                 dropped, self._result = self._result, None
-            return True, ('nothing running' if dropped is None
-                          else f'result of recording {dropped.index} dropped (files kept)')
-        self._stop.set()
+                return True, ('nothing running' if dropped is None
+                              else f'result of recording {dropped.index} dropped (files kept)')
+            if phase == 'recording':
+                self._stop.set()
         thread.join(timeout_s)
         if thread.is_alive():
-            return False, f'recording did not stop within {timeout_s} s'
+            return False, f'recording {index} did not finish within {timeout_s} s'
         with self._lock:
-            self._result = None
-        return True, 'recording aborted'
+            dropped, self._result = self._result, None
+        if dropped is None:
+            return True, f'recording {index} aborted (nothing saved)'
+        return True, (f'recording {index} had already finished and is saved '
+                      f'({dropped.file or "not saved"}); its result is dropped')
+
+    def discard(self, reason):
+        """Mark the recording last returned by get as not valid, in its .json and the CSV.
+
+        For a caller that finds afterwards that the recording does not match what it
+        measured (e.g. the motion started late). Returns (ok, message).
+        """
+        with self._lock:
+            result, self._last_read = self._last_read, None
+        if result is None:
+            return False, 'no recording returned by get to discard'
+        result.valid = False
+        result.error = '; '.join(filter(None, [result.error, f'discarded: {reason}']))
+        if not result.file:
+            return True, f'recording {result.index} discarded (it had no file)'
+        meta_path = result.file[:-4] + '.json'
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+            meta['discarded'] = reason
+            meta['valid'] = False
+            tmp = meta_path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(meta, f, indent=1)
+            os.replace(tmp, meta_path)
+            self._log_row(result, meta['start_wall_time'], meta['start_ros_time_s'],
+                          valid=False, note=f'discarded: {reason}')
+        except Exception as e:
+            return False, f'recording {result.index}: discard not written ({e})'
+        self.on_result(result)
+        return True, f'recording {result.index} discarded: {reason}'
 
     def busy(self):
         return self._thread is not None and self._thread.is_alive()
@@ -187,6 +243,7 @@ class AeRecorder:
             rec = self.scope.record(should_stop=self._stop.is_set, now=on_start)
         except RecordingAborted:
             self.log(f'recording {index} aborted (nothing saved)')
+            info['error'] = f'recording {index} aborted'
             started.set()
             return
         except Exception as e:  # SDK error: report it through get
@@ -194,6 +251,8 @@ class AeRecorder:
             started.set()
             self._finish(RecordResult(index=index, file='', error=info['error']))
             return
+        with self._lock:
+            self._phase = 'saving'  # from here stop no longer aborts
         result = RecordResult(index=index, file='', sample_rate_hz=rec.sample_rate_hz,
                               num_samples=len(rec.ch1_v), lost_samples=rec.lost_samples,
                               corrupted_samples=rec.corrupted_samples)
@@ -249,19 +308,25 @@ class AeRecorder:
                 'definition': 'ROS 1 analysis_ae.py spectrum_integration',
             },
             'errors': errors,
+            'valid': not errors,
             **self.extra_metadata,
         }
         with open(base + '.json', 'x') as f:
             json.dump(meta, f, indent=1)
-        if self.feature_log_csv:
-            log = self.feature_log_csv
-            new = not os.path.exists(log) or os.path.getsize(log) == 0
-            with open(self.feature_log_csv, 'a', newline='') as f:
-                writer = csv.writer(f)
-                if new:
-                    writer.writerow(CSV_FIELDS)
-                writer.writerow([index, meta['start_wall_time'], wall['ros_time_s'], npy,
-                                 rec.sample_rate_hz, len(rec.ch1_v), rec.lost_samples,
-                                 rec.corrupted_samples, self.skip_samples,
-                                 self.frequency_threshold_hz, result.value_v2, not errors])
+        self._log_row(result, meta['start_wall_time'], wall['ros_time_s'], valid=not errors,
+                      file=npy)
         return npy
+
+    def _log_row(self, result, start_wall_time, start_ros_time_s, valid, file=None, note=''):
+        if not self.feature_log_csv:
+            return
+        log = self.feature_log_csv
+        new = not os.path.exists(log) or os.path.getsize(log) == 0
+        with open(log, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if new:
+                writer.writerow(CSV_FIELDS)
+            writer.writerow([result.index, start_wall_time, start_ros_time_s, file or result.file,
+                             result.sample_rate_hz, result.num_samples, result.lost_samples,
+                             result.corrupted_samples, self.skip_samples,
+                             self.frequency_threshold_hz, result.value_v2, valid, note])

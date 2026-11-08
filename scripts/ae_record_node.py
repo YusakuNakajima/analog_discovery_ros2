@@ -7,7 +7,11 @@ Services (std_srvs/Trigger):
     ~/get    wait (up to get_timeout_s) until the last recording is saved; the message
              gives ae_spectrum_integral (ROS 1 formula, V^2) and the file. success is
              false when samples were lost, the file could not be written, etc.
-    ~/stop   abort a running recording (nothing saved) / drop an unread result.
+    ~/stop   abort a recording still being recorded (nothing saved) / drop an unread result;
+             one already being saved is not aborted (the message says so).
+    ~/discard  mark the recording last returned by ~/get as not valid (.json "discarded",
+             a second CSV row with valid False): for a caller that finds it did not line
+             up with the motion.
 Topic:
     ~/ae_spectrum_integral_v2  std_msgs/Float64, after each saved recording (also invalid
                                ones, as NaN), so that rosbag gets it too
@@ -87,6 +91,7 @@ class AeRecordNode(Node):
         self.create_service(Trigger, '~/start', self._start, callback_group=group)
         self.create_service(Trigger, '~/get', self._get, callback_group=group)
         self.create_service(Trigger, '~/stop', self._stop, callback_group=group)
+        self.create_service(Trigger, '~/discard', self._discard, callback_group=group)
         self.get_logger().info(
             f'{self.scope.device_name}: CH1 +-{s.ch1_range_peak_v:g} V, {s.num_samples()} samples '
             f'at {s.sample_rate_hz:g} Hz ({s.duration_s:g} s) per recording -> {record_dir}'
@@ -117,6 +122,15 @@ class AeRecordNode(Node):
     def _stop(self, _req, res):
         res.success, res.message = self.recorder.stop()
         self.get_logger().info(f'stop: {res.message}')
+        return res
+
+    def _discard(self, _req, res):
+        res.success, res.message = self.recorder.discard('requested by the caller (the recording '
+                                                         'did not line up with the motion)')
+        if res.success:
+            self.get_logger().warn(f'discard: {res.message}')
+        else:
+            self.get_logger().error(f'discard: {res.message}')
         return res
 
     def shutdown(self):

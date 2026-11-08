@@ -213,7 +213,8 @@ class AnalogDiscoveryScope:
                stall_timeout_s=None):
         """Start the configured recording and read it to the end (blocking); return a Recording.
 
-        now() (if given) is called right after the start command, for the start stamp.
+        now() (if given) is called when the first samples arrive (proof that the device
+        records; sample 0 is earlier by the samples already delivered, a few ms).
         should_stop() is checked between reads; RecordingAborted is raised when it is true.
         Can be called again for the next recording with the same settings.
         """
@@ -404,7 +405,8 @@ def _record(scope, should_stop=None, now=None, poll_period_s=0.001,
     state, available, lost, corrupted = ctypes.c_ubyte(), _int(), _int(), _int()
     got = lost_total = corrupted_total = 0
     call('FDwfAnalogInConfigure', h, _int(0), _int(1))  # start
-    start_time = now() if now is not None else None
+    start_time = None
+    seen_data = False
     last_progress = clock()
     try:
         while got < n:
@@ -429,6 +431,9 @@ def _record(scope, should_stop=None, now=None, poll_period_s=0.001,
                     got += take
                 if take > 0 or lost.value > 0:
                     last_progress = clock()
+                    if not seen_data:  # the device is recording: samples arrived
+                        seen_data = True
+                        start_time = now() if now is not None else None
                 if got < n and state.value == d.STATE_DONE and available.value == 0:
                     raise d.DwfError(f'recording ended after {got} of {n} samples')
             if got < n:

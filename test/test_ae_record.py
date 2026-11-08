@@ -126,7 +126,17 @@ def test_record_reads_every_chunk_in_order_and_stops_the_device():
     assert (rec.lost_samples, rec.corrupted_samples, rec.start_time) == (0, 0, 'T')
     configures = [c[1][1:] for c in lib.calls if c[0] == 'FDwfAnalogInConfigure']
     assert configures == [[1, 0], [0, 1], [0, 0]]  # applied, started, stopped
-    assert names(lib)[stamps[0] - 1] == 'FDwfAnalogInConfigure'  # stamped right at the start
+    # stamped when the first samples were read, not at the start command
+    assert names(lib)[stamps[0] - 1] == 'FDwfAnalogInStatusData'
+    assert stamps[0] - 1 == names(lib).index('FDwfAnalogInStatusData')
+
+
+def test_record_does_not_stamp_a_start_that_never_delivers():
+    scope, lib = recording_scope([], states=[d.STATE_ARMED] * 1000)
+    stamps = []
+    with pytest.raises(d.DwfError, match='no samples'):
+        scope.record(now=lambda: stamps.append(1), poll_period_s=0.0, stall_timeout_s=0.05)
+    assert stamps == []
 
 
 def test_record_counts_lost_samples_and_keeps_their_place():
@@ -228,7 +238,7 @@ def test_get_does_not_return_the_same_recording_twice(tmp_path):
     rec.start()
     assert rec.get(5.0)[0]
     ok, message = rec.get(1.0)
-    assert not ok and 'no new recording' in message
+    assert not ok and 'already read' in message
     assert rec.start()[0] and rec.get(5.0)[0]  # the next cycle
     assert len(list(csv.DictReader(open(tmp_path / 'ae.csv')))) == 2
     assert len(os.listdir(tmp_path / 'ae')) == 4
@@ -248,9 +258,9 @@ def test_start_is_refused_while_recording_and_stop_aborts_without_saving(tmp_pat
     rec, _, results = mock_recorder(tmp_path, realtime=True, duration_s=5.0)
     assert rec.start()[0]
     ok, message = rec.start()
-    assert not ok and 'still running' in message
+    assert not ok and 'still recording' in message
     t0 = time.monotonic()
-    assert rec.stop() == (True, 'recording aborted')
+    assert rec.stop() == (True, 'recording 1 aborted (nothing saved)')
     assert time.monotonic() - t0 < 1.0
     assert not rec.busy() and results == []
     assert os.listdir(tmp_path / 'ae') == []
@@ -328,3 +338,78 @@ def test_ctypes_pointer_of_a_numpy_chunk_is_written_in_place():
     ptr = buf.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
     ptr[1] = 2.0
     assert buf[1] == 2.0
+
+
+def test_frequency_threshold_must_leave_bins(tmp_path):
+    scope = MockScope(realtime=False)
+    scope.configure_record(RecordSettings(sample_rate_hz=1e6, duration_s=0.3))
+    for bad in (float('nan'), -1.0, 5e5, 6e5):
+        with pytest.raises(ValueError, match='frequency_threshold_hz'):
+            AeRecorder(scope, str(tmp_path), skip_samples=0, frequency_threshold_hz=bad)
+    AeRecorder(scope, str(tmp_path), skip_samples=0, frequency_threshold_hz=4.99e5)
+
+
+def test_get_never_returns_a_newer_recording_than_it_waited_for(tmp_path):
+    rec, _, _ = mock_recorder(tmp_path)
+    rec.start()
+    rec._thread.join()
+    real_join = threading.Thread.join
+
+    def join_then_restart(thread, timeout=None):
+        real_join(thread, timeout)
+        thread.join = lambda timeout=None: None
+        rec.start()  # a second start between get's wait and its read
+        real_join(rec._thread)
+    rec._thread.join = lambda timeout=None: join_then_restart(rec._thread, timeout)
+    ok, message = rec.get(5.0)
+    assert not ok and 'recording 1' in message and 'replaced' in message
+
+
+def test_stop_while_saving_reports_the_saved_recording(tmp_path, monkeypatch):
+    rec, _, _ = mock_recorder(tmp_path)
+    saving = threading.Event()
+    release = threading.Event()
+    real = ae_record.spectrum_integral_v2
+
+    def slow(*a, **kw):
+        saving.set()
+        release.wait(5.0)
+        return real(*a, **kw)
+    monkeypatch.setattr(ae_record, 'spectrum_integral_v2', slow)
+    assert rec.start()[0]
+    assert saving.wait(5.0)
+    answer = []
+    t = threading.Thread(target=lambda: answer.append(rec.stop()))
+    t.start()
+    time.sleep(0.1)
+    release.set()
+    t.join(5.0)
+    ok, message = answer[0]
+    assert ok and 'already finished and is saved' in message
+    assert len([f for f in os.listdir(tmp_path / 'ae') if f.endswith('.npy')]) == 1
+
+
+def test_an_aborted_start_is_not_reported_as_started(tmp_path):
+    rec, scope, _ = mock_recorder(tmp_path)
+
+    def aborted(**kw):
+        raise RecordingAborted('stopped')
+    scope.record = aborted
+    ok, message = rec.start()
+    assert not ok and 'aborted' in message
+
+
+def test_discard_marks_the_last_read_recording(tmp_path):
+    rec, _, results = mock_recorder(tmp_path)
+    rec.start()
+    ok, result = rec.get(5.0)
+    assert ok
+    ok, message = rec.discard('motion started late')
+    assert ok and 'discarded' in message
+    meta = json.load(open(result.file[:-4] + '.json'))
+    assert meta['valid'] is False and meta['discarded'] == 'motion started late'
+    rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
+    assert [(r['index'], r['valid']) for r in rows] == [('1', 'True'), ('1', 'False')]
+    assert rows[1]['note'] == 'discarded: motion started late'
+    assert results[-1].valid is False
+    assert not rec.discard('again')[0]  # only once, only after get
