@@ -9,9 +9,10 @@ Services (std_srvs/Trigger):
              false when samples were lost, the file could not be written, etc.
     ~/stop   abort a recording still being recorded (nothing saved) / drop an unread result;
              one already being saved is not aborted (the message says so).
-    ~/discard  mark the recording last returned by ~/get as not valid (.json "discarded",
-             a second CSV row with valid False): for a caller that finds it did not line
-             up with the motion.
+    ~/discard  make sure the latest recording is not used: abort it while it records
+             (nothing saved), else wait for its save and mark it not valid (.json
+             "discarded", a second CSV row with valid False), read by ~/get or not.
+             For a caller whose motion was aborted or did not line up. Retryable.
 Topic:
     ~/ae_spectrum_integral_v2  std_msgs/Float64, after each saved recording (also invalid
                                ones, as NaN), so that rosbag gets it too
@@ -125,8 +126,9 @@ class AeRecordNode(Node):
         return res
 
     def _discard(self, _req, res):
-        res.success, res.message = self.recorder.discard('requested by the caller (the recording '
-                                                         'did not line up with the motion)')
+        res.success, res.message = self.recorder.discard(
+            'requested by the caller (the recording did not line up with the motion)',
+            timeout_s=self.scope.record_settings.duration_s + self.get_margin_s)
         if res.success:
             self.get_logger().warn(f'discard: {res.message}')
         else:

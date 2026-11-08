@@ -412,4 +412,71 @@ def test_discard_marks_the_last_read_recording(tmp_path):
     assert [(r['index'], r['valid']) for r in rows] == [('1', 'True'), ('1', 'False')]
     assert rows[1]['note'] == 'discarded: motion started late'
     assert results[-1].valid is False
-    assert not rec.discard('again')[0]  # only once, only after get
+    ok, message = rec.discard('again')  # idempotent: no third CSV row
+    assert ok and 'already discarded' in message
+    assert len(list(csv.DictReader(open(tmp_path / 'ae.csv')))) == 2
+
+
+def test_discard_aborts_a_running_recording(tmp_path):
+    rec, _, results = mock_recorder(tmp_path, realtime=True, duration_s=5.0)
+    assert rec.start()[0]
+    ok, message = rec.discard('motion aborted', timeout_s=5.0)
+    assert ok and 'aborted (nothing saved)' in message
+    assert os.listdir(tmp_path / 'ae') == [] and results == []
+
+
+def test_discard_of_an_unread_recording_and_without_any(tmp_path):
+    rec, _, _ = mock_recorder(tmp_path)
+    assert not rec.discard('x')[0]  # nothing started yet
+    rec.start()
+    ok, message = rec.discard('motion aborted', timeout_s=5.0)  # waits for the save
+    assert ok and 'discarded' in message
+    assert not rec.get(1.0)[0]  # the discarded result is not handed out any more
+    rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
+    assert [r['valid'] for r in rows] == ['True', 'False']
+
+
+def test_a_failed_discard_can_be_repeated(tmp_path, monkeypatch):
+    rec, _, _ = mock_recorder(tmp_path)
+    rec.start()
+    ok, result = rec.get(5.0)
+    real = rec._write_meta
+    monkeypatch.setattr(rec, '_write_meta', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
+    ok, message = rec.discard('late')
+    assert not ok and 'disk full' in message and 'try again' in message
+    assert json.load(open(result.file[:-4] + '.json'))['valid'] is True
+    monkeypatch.setattr(rec, '_write_meta', real)
+    assert rec.discard('late')[0]
+    assert json.load(open(result.file[:-4] + '.json'))['valid'] is False
+
+
+def test_an_old_stop_does_not_drop_a_newer_result(tmp_path):
+    rec, _, _ = mock_recorder(tmp_path)
+    rec.start()
+    rec._thread.join()
+    real_join = threading.Thread.join
+
+    def join_then_restart(thread, timeout=None):
+        real_join(thread, timeout)
+        rec.start()  # recording 2 starts and finishes before stop takes the lock again
+        real_join(rec._thread)
+    rec._phase = 'saving'
+    thread = rec._thread
+    alive = iter([True])  # stop's first look: recording 1 still being saved; then done
+    thread.is_alive = lambda: next(alive, False)
+    thread.join = lambda timeout=None: join_then_restart(thread, timeout)
+    rec._thread = thread
+    rec._result = None
+    assert rec.stop()[0]
+    ok, result = rec.get(5.0)
+    assert ok and result.index == 2
+
+
+def test_a_failed_csv_row_leaves_the_metadata_not_valid(tmp_path):
+    rec, _, _ = mock_recorder(tmp_path)
+    rec.feature_log_csv = str(tmp_path / 'missing_dir' / 'ae.csv')
+    rec.start()
+    ok, result = rec.get(5.0)
+    assert not ok and 'CSV row not written' in result.error and result.file
+    meta = json.load(open(result.file[:-4] + '.json'))
+    assert meta['valid'] is False and any('CSV' in e for e in meta['errors'])

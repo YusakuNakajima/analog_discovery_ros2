@@ -71,6 +71,9 @@ class RecordResult:
     value_v2: float = float('nan')
     valid: bool = False  # saved, complete (no lost / corrupted samples) and computed
     error: str = ''
+    start_wall_time: str = ''
+    start_ros_time_s: float = float('nan')
+    discarded: str = ''  # reason, once discard() has written it
 
     def message(self):
         text = (f'{FEATURE_NAME}={self.value_v2:.9g} {FEATURE_UNIT} index={self.index} '
@@ -112,7 +115,7 @@ class AeRecorder:
         self._stop = threading.Event()
         self._index = 0
         self._result = None  # RecordResult of the last finished recording, until get()
-        self._last_read = None  # RecordResult last returned by get (for discard)
+        self._latest = None  # RecordResult of the latest finished recording (for discard)
         self._phase = 'idle'  # recording | saving (while the thread runs)
 
     # --- commands (thread-safe) ---
@@ -165,62 +168,76 @@ class AeRecorder:
                 return False, (f'no unread result of recording {index} '
                                '(already read, aborted, or replaced by a newer start)')
             self._result = None
-            self._last_read = result
         return result.valid, result
 
     def stop(self, timeout_s=5.0):
         """Abort a recording still being recorded (nothing is saved). Returns (ok, message).
 
         A recording already being saved is not aborted: stop waits for it and says so.
+        Only the result of that recording is dropped, never one of a later start.
         """
         with self._lock:
             thread, index, phase = self._thread, self._index, self._phase
             if thread is None or not thread.is_alive():
-                dropped, self._result = self._result, None
+                dropped = self._take_result(index)
                 return True, ('nothing running' if dropped is None
-                              else f'result of recording {dropped.index} dropped (files kept)')
+                              else f'result of recording {index} dropped (files kept)')
             if phase == 'recording':
                 self._stop.set()
         thread.join(timeout_s)
         if thread.is_alive():
             return False, f'recording {index} did not finish within {timeout_s} s'
         with self._lock:
-            dropped, self._result = self._result, None
+            dropped = self._take_result(index)
         if dropped is None:
             return True, f'recording {index} aborted (nothing saved)'
         return True, (f'recording {index} had already finished and is saved '
                       f'({dropped.file or "not saved"}); its result is dropped')
 
-    def discard(self, reason):
-        """Mark the recording last returned by get as not valid, in its .json and the CSV.
+    def discard(self, reason, timeout_s=None):
+        """Make sure the latest started recording is not used: abort it while it records
+        (nothing saved), else wait for its save and mark it not valid in its .json and with
+        a second CSV row (valid False). Read by get or not. Returns (ok, message); on a
+        failed write the same recording can be discarded again.
 
-        For a caller that finds afterwards that the recording does not match what it
-        measured (e.g. the motion started late). Returns (ok, message).
+        For a caller that finds the recording does not match what it measured (motion
+        aborted, started late).
         """
         with self._lock:
-            result, self._last_read = self._last_read, None
-        if result is None:
-            return False, 'no recording returned by get to discard'
-        result.valid = False
-        result.error = '; '.join(filter(None, [result.error, f'discarded: {reason}']))
-        if not result.file:
-            return True, f'recording {result.index} discarded (it had no file)'
-        meta_path = result.file[:-4] + '.json'
-        try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-            meta['discarded'] = reason
-            meta['valid'] = False
-            tmp = meta_path + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(meta, f, indent=1)
-            os.replace(tmp, meta_path)
-            self._log_row(result, meta['start_wall_time'], meta['start_ros_time_s'],
-                          valid=False, note=f'discarded: {reason}')
-        except Exception as e:
-            return False, f'recording {result.index}: discard not written ({e})'
-        self.on_result(result)
-        return True, f'recording {result.index} discarded: {reason}'
+            thread, index, phase = self._thread, self._index, self._phase
+            if thread is not None and thread.is_alive() and phase == 'recording':
+                self._stop.set()
+        if thread is not None:
+            thread.join(timeout_s)
+            if thread.is_alive():
+                return False, f'recording {index} did not finish within {timeout_s} s'
+        with self._lock:
+            latest = self._latest
+            self._take_result(index)
+        if latest is None or latest.index != index:
+            if index == 0:
+                return False, 'no recording to discard'
+            return True, f'recording {index} aborted (nothing saved)'
+        if latest.discarded:
+            return True, f'recording {index} already discarded ({latest.discarded})'
+        if latest.file:
+            try:
+                self._write_meta(latest.file, {'discarded': reason, 'valid': False})
+                self._log_row(latest, valid=False, note=f'discarded: {reason}')
+            except Exception as e:
+                return False, f'recording {index}: discard not written ({e}); try again'
+        latest.discarded = reason
+        latest.valid = False
+        latest.error = '; '.join(filter(None, [latest.error, f'discarded: {reason}']))
+        self.on_result(latest)
+        return True, f'recording {index} discarded: {reason}'
+
+    def _take_result(self, index):
+        """Under the lock: drop and return the unread result if it is recording index's."""
+        if self._result is not None and self._result.index == index:
+            result, self._result = self._result, None
+            return result
+        return None
 
     def busy(self):
         return self._thread is not None and self._thread.is_alive()
@@ -265,10 +282,9 @@ class AeRecorder:
         if rec.lost_samples or rec.corrupted_samples:
             errors.append(f'{rec.lost_samples} samples lost, {rec.corrupted_samples} corrupted '
                           '(the host did not read the device fast enough); value not valid')
-        try:
-            result.file = self._save(index, wall, rec, result, errors)
-        except Exception as e:
-            errors.append(f'not saved: {e}')
+        result.start_wall_time = wall['time'].isoformat()
+        result.start_ros_time_s = wall['ros_time_s']
+        self._save(index, wall, rec, result, errors)
         result.error = '; '.join(errors)
         result.valid = not errors
         self._finish(result)
@@ -276,21 +292,29 @@ class AeRecorder:
     def _finish(self, result):
         with self._lock:
             self._result = result
+            self._latest = result
         self.log(result.message())
         self.on_result(result)
 
     def _save(self, index, wall, rec, result, errors):
+        """Write .npy, .json, the CSV row; failures go to errors, and the .json and the CSV
+        row always end with the final valid flag (a failed CSV row is noted in the .json)."""
         stamp = wall['time'].strftime('%Y%m%d_%H%M%S')
         base = os.path.join(self.record_dir, f'ae_{stamp}_{index:04d}')
         npy = base + '.npy'
-        with open(npy, 'xb') as f:  # never overwrite an earlier recording
-            np.save(f, rec.ch1_v.astype(np.float32, copy=False))
+        try:
+            with open(npy, 'xb') as f:  # never overwrite an earlier recording
+                np.save(f, rec.ch1_v.astype(np.float32, copy=False))
+        except Exception as e:
+            errors.append(f'not saved: {e}')
+            return
+        result.file = npy
         s = self.scope.record_settings
         meta = {
             'file': os.path.basename(npy),
             'index': index,
-            'start_wall_time': wall['time'].isoformat(),
-            'start_ros_time_s': wall['ros_time_s'],
+            'start_wall_time': result.start_wall_time,
+            'start_ros_time_s': result.start_ros_time_s,
             'channel': 'ch1',
             'unit': 'V',
             'dtype': 'float32',
@@ -311,13 +335,31 @@ class AeRecorder:
             'valid': not errors,
             **self.extra_metadata,
         }
-        with open(base + '.json', 'x') as f:
-            json.dump(meta, f, indent=1)
-        self._log_row(result, meta['start_wall_time'], wall['ros_time_s'], valid=not errors,
-                      file=npy)
-        return npy
+        try:
+            with open(base + '.json', 'x') as f:
+                json.dump(meta, f, indent=1)
+        except Exception as e:
+            errors.append(f'metadata not saved: {e}')
+        try:
+            self._log_row(result, valid=not errors)
+        except Exception as e:
+            errors.append(f'CSV row not written: {e}')
+            try:
+                self._write_meta(npy, {'errors': errors, 'valid': False})
+            except Exception:
+                pass  # already reported through errors (get fails)
 
-    def _log_row(self, result, start_wall_time, start_ros_time_s, valid, file=None, note=''):
+    def _write_meta(self, npy, changes):
+        meta_path = npy[:-4] + '.json'
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta.update(changes)
+        tmp = meta_path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(meta, f, indent=1)
+        os.replace(tmp, meta_path)
+
+    def _log_row(self, result, valid, note=''):
         if not self.feature_log_csv:
             return
         log = self.feature_log_csv
@@ -326,7 +368,7 @@ class AeRecorder:
             writer = csv.writer(f)
             if new:
                 writer.writerow(CSV_FIELDS)
-            writer.writerow([result.index, start_wall_time, start_ros_time_s, file or result.file,
+            writer.writerow([result.index, result.start_wall_time, result.start_ros_time_s, result.file,
                              result.sample_rate_hz, result.num_samples, result.lost_samples,
                              result.corrupted_samples, self.skip_samples,
                              self.frequency_threshold_hz, result.value_v2, valid, note])

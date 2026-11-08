@@ -150,7 +150,7 @@ ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中
 | `~/start` | 収録を始める。収録中・保存中は断る。空き容量が1回分（＋200 MB）より少なければ断る |
 | `~/get` | 直前に始めた収録の保存・計算が終わるまで待ち（`duration_s` + `get_margin_s`）、`ae_spectrum_integral=... V^2 file=...` を返す。サンプルの欠落・保存の失敗があれば `success: false`。同じ収録は2回返さず、待っている間に次の `start` が来たら何も返さない |
 | `~/stop` | 収録中なら中止する（何も保存しない）。収録が終わって保存中なら中止せず、保存を待ってそう返す。読まれていない結果は捨てる（ファイルは残る） |
-| `~/discard` | 直前に `~/get` が返した収録を無効にする（`.json` に `discarded`・`valid: false`、CSV に同じ番号で `valid` False の行を追加）。粉砕と時間が合わなかったサイクル用 |
+| `~/discard` | 最後に始めた収録を使わせない: 収録中なら中止（保存しない）、そうでなければ保存を待って無効にする（`.json` に `discarded`・`valid: false`、CSV に同じ番号で `valid` False の行を追加）。`~/get` で読んだかどうかによらない。書き込みに失敗したら再実行できる。粉砕が失敗した・時間が合わなかったサイクル用 |
 | `~/ae_spectrum_integral_v2` | `std_msgs/Float64`。保存した収録ごと（無効な収録は NaN）。rosbag 用 |
 
 - `frequency_threshold_hz` は 0 以上、サンプリング周波数の半分未満でないと起動しない（超えるビンが無いと値が常に 0 になる）。
