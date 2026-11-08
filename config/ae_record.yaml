@@ -1,0 +1,29 @@
+# Continuous AE recording (ae_record_node.py), one per grinding cycle as in ROS 1
+# grinding_takamoto_with_AE (acoustic_emission_service.py "start" / "get").
+# CH1 = NF AE9501B RF output (as config/analog_discovery.yaml).
+# Verification: fake libdwf and the mock only; NOT yet recorded on the AD3 (whether the
+# host keeps up with 2 MS/s without lost samples is unchecked; get reports lost samples).
+ae_recorder:
+  ros__parameters:
+    backend: dwf             # dwf (WaveForms SDK, real device) | mock (simulated bursts)
+    serial: ''               # '' = first free AD3/AD2; e.g. '210415BF81F3'
+    config_index: -1         # -1 = device configuration with the largest scope buffer
+    settle_s: 0.2            # s, wait after configuring (README, settle_s)
+
+    sample_rate_hz: 2000000.0  # Hz; ROS 1 recording (time_per_sample_s 5e-7). Nyquist 1 MHz,
+                               # below the AE9501B 2 MHz band edge, as in ROS 1
+    duration_s: 12.0           # s per recording; = the grinding trajectory of
+                               # grinding_with_vibration (24 x 0.5 s) and the M5Stack window.
+                               # ROS 1's length was set on the Windows PC (not in the repo).
+                               # 12 s x 2 MHz x 4 B = 96 MB per recording (.npy float32)
+    ch1_range_peak_v: 2.5      # +-V; AD3 offers +-2.5 V and +-25 V (finger taps peaked at 1.16 V)
+
+    # ROS 1 analysis_ae.py: start_sample_index 200013 (1-based) at 2 MHz = first 0.1 s skipped
+    skip_samples: 200012
+    frequency_threshold_hz: 100000.0  # Hz; bins strictly above this are summed (ROS 1)
+
+    start_timeout_s: 2.0     # s, ~/start fails when the device has not started by then
+    get_margin_s: 20.0       # s, ~/get waits duration_s + this for the save and the FFT
+
+    record_dir: ''           # required; the launch sets it (record_dir:=...)
+    feature_log_csv: ''      # '' = <none>; one row per recording

@@ -21,6 +21,7 @@ DECI_ANALOG_IN_BUFFER_SIZE = 7  # FDwfEnumConfigInfo: scope buffer per channel
 
 # --- Analog in ---
 ACQMODE_SINGLE = 0
+ACQMODE_RECORD = 3  # continuous streaming to the host (ae_record_node.py)
 TRIGSRC_NONE = 0
 TRIGSRC_DETECTOR_ANALOG_IN = 2
 TRIGTYPE_EDGE = 0

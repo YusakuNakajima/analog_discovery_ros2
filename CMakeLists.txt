@@ -40,6 +40,10 @@ if(BUILD_TESTING)
     test/test_ae_features.py
     APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
   )
+  ament_add_pytest_test(test_ae_record
+    test/test_ae_record.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+  )
 endif()
 
 #-- for Python
@@ -50,6 +54,7 @@ ament_python_install_package(analog_discovery)
 install(PROGRAMS
   scripts/analog_discovery_node.py
   scripts/ae_features_node.py
+  scripts/ae_record_node.py
   scripts/ad_probe.py
   scripts/ad_selftest.py
   DESTINATION lib/${PROJECT_NAME}

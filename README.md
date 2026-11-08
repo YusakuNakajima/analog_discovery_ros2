@@ -3,6 +3,7 @@
 Digilent Analog Discovery 3（AD3）のオシロスコープ入力（2ch、14bit、最大 125 MS/s）を、
 **トリガ取り込み**で ROS 2 Humble に流すドライバ。インパルスのような短い現象を、前後を含めて
 高速に1波形ずつ取る用途向け。Digilent WaveForms SDK（`libdwf`）を ctypes で呼ぶ。AD2 でも動く想定（未確認）。
+AE を粉砕中ずっと記録するための連続収録（Record モード、`ae_record_node.py`）もある（[下記](#ae-の連続収録ae_record_nodepy)）。
 
 ## 現状
 
@@ -10,6 +11,7 @@ Digilent Analog Discovery 3（AD3）のオシロスコープ入力（2ch、14bit
 | --- | --- |
 | SDK 呼び出し・トリガ取り込み・ノード・メッセージ | 実装済み。偽の libdwf を使うテストと、mock（模擬インパルス）での通しの動作を確認済み |
 | AD3 実機 | セットアップ（`setup.sh`）、デバイスの列挙、自動トリガでの取り込み（`ad_selftest.py`）を確認済み（2026-10-22、コンテナの `ros` ユーザー、`privileged`）。CH1 の信号でのトリガ取り込みは未確認 |
+| 連続収録（`ae_record_node.py`） | 実装済み。偽の libdwf と mock でのみ確認。**AD3 実機では未確認**（2 MS/s で欠落なく受け取れるか） |
 | USB 給電 | AD3 は 600 mA 以上が必要。USB 2.0 ハブを2段経由した接続では、アナログ回路が止まって取り込みが始まらなかった（今は開くときにエラーにする）。PC の USB ポートに直接つなぐ |
 | トリガ位置の向き | **未確認。** SDK の `TriggerPositionSet` は「0 = バッファ中央、正 = トリガが先頭側へ」と仮定している。`ad_selftest.py --loopback` で確かめる |
 
@@ -127,10 +129,45 @@ ros2 run rqt_plot rqt_plot /ae_features/activity/energy_rate_v2 /ae_features/act
 ros2 bag record /analog_discovery/capture /ae_features/hit /ae_features/activity
 ```
 
+## AE の連続収録（ae_record_node.py）
+
+ROS 1 の `grinding_takamoto_with_AE`（`acoustic_emission_service.py` の `start` / `get`。Windows PC が 2 MHz で収録して
+NAS に CSV を書き、`analysis_ae.py` が値を出していた）の置き換え。要求のたびに CH1 を **Record モード**
+（トリガなしの連続収録。サンプルを読みながら USB で受け取るので、長さは装置のバッファに縛られない）で
+`duration_s` 収録し、ファイルに保存して ROS 1 と同じ式で値を出す。粉砕と同時に記録するのは
+`onolab_motion_routines` の `grinding_with_vibration.launch.py ae:=true`（振動の M5Stack と同じサイクル）。
+
+```bash
+ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/path/to/ae feature_log_csv:=/path/to/ae.csv
+ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/tmp/ae backend:=mock   # 実機なし
+ros2 service call /ae_recorder/start std_srvs/srv/Trigger   # 収録を始めたら返る
+ros2 service call /ae_recorder/get std_srvs/srv/Trigger     # 保存と計算を待って値を返す
+ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中止（保存しない）
+```
+
+| サービス / トピック | 内容 |
+| --- | --- |
+| `~/start` | 収録を始める。収録中・保存中は断る。空き容量が1回分（＋200 MB）より少なければ断る |
+| `~/get` | 直前の収録の保存・計算が終わるまで待ち（`duration_s` + `get_margin_s`）、`ae_spectrum_integral=... V^2 file=...` を返す。サンプルの欠落・保存の失敗があれば `success: false`。同じ収録は2回返さない |
+| `~/stop` | 収録中なら中止する（何も保存しない）。読まれていない結果は捨てる（ファイルは残る） |
+| `~/ae_spectrum_integral_v2` | `std_msgs/Float64`。保存した収録ごと（無効な収録は NaN）。rosbag 用 |
+
+- 1回の収録: `<record_dir>/ae_<YYYYmmdd_HHMMSS>_<番号>.npy`（float32、V、CH1）と `.json`（サンプリング周波数、
+  開始時刻（壁時計と ROS 時刻）、欠落サンプル数、レンジ、値と式のパラメータ）。`get` を呼ばなくても保存する。既存のファイルは上書きしない。
+- 値（`ae_spectrum_integral`、V²）: 先頭 `skip_samples`（200012 = 0.1 s）を捨て、`rfft` の 100 kHz を超えるビンの
+  `(|X|·2/N)²` の和。ROS 1 の `spectrum_integration`（`fft` + `fftfreq`）と同じ値になることを `test/test_ae_record.py` が確かめる。
+  ROS 1 はADコードを ±1 V に換算していて、AD3 は入力端の電圧なので、ROS 1 の目標値（`target_ae_integral`）とは比べられない。
+- 既定（`config/ae_record.yaml`）: 2 MS/s（ROS 1 と同じ）、12 s（粉砕軌道 24 周 × 0.5 s）、±2.5 V。1回 96 MB。
+  ROS 1 の収録長は Windows PC 側の設定で、リポジトリには残っていない。
+- 装置が上書きする前にホストが読めなかったサンプルは「欠落」（その位置は 0 V）として数える。**2 MS/s を欠落なく
+  受け取れるかは実機で未確認**（偽の libdwf と mock でのみ確認）。`get` が欠落を報告したら、レートを下げるか、USB の
+  つなぎ方（ハブを通さない）を見直す。
+- 装置は起動時に開いたままにするので、トリガ取り込みのノード（`analog_discovery_node.py`）とは同時に動かせない。
+
 ## 制約
 
 - **不感時間がある。** 取り込みを読み出してから再アームするので、読み出し中のトリガは取りこぼす。
-  間隔の短いイベントが続く用途には向かない（その場合は Record モードの連続記録が必要。未実装）。
+  間隔の短いイベントが続く用途には向かない（その場合は上の連続収録を使う）。
 - 1回の取り込みは最大 32 Ki サンプル/ch（AD3 の構成 2。`config_index: -1` で自動的に選ぶ）。
 - 入力は 1 MΩ‖24 pF、±50 V まで保護（データシート）。BNC Adapter Board 経由ではシングルエンド測定になる。
   W1 / W2 の BNC は波形発生器の出力なので、信号を入れない。
