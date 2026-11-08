@@ -2,8 +2,8 @@
 #
 # Continuous AE recording on request (ae_record_node.py; ROS 1 acoustic_emission_service.py).
 #   ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/path/to/ae
-#   ros2 service call /ae_recorder/start std_srvs/srv/Trigger
-#   ros2 service call /ae_recorder/get std_srvs/srv/Trigger
+#   ros2 service call /ae_recorder/command analog_discovery_ros2/srv/AeRecordCommand "{command: start}"
+#   ros2 service call /ae_recorder/command analog_discovery_ros2/srv/AeRecordCommand "{command: get}"
 # Settings: config/ae_record.yaml. Not together with analog_discovery.launch.py (one device).
 
 from launch import LaunchDescription

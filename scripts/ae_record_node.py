@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """Record the AE signal continuously on request, one recording per grinding cycle (ROS 1 style).
 
-Services (std_srvs/Trigger):
-    ~/start  start a recording of duration_s at sample_rate_hz on CH1 (Record mode);
-             answers once the device records. Refused while one is running.
-    ~/get    wait (up to get_timeout_s) until the last recording is saved; the message
-             gives ae_spectrum_integral (ROS 1 formula, V^2) and the file. success is
-             false when samples were lost, the file could not be written, etc.
-    ~/stop   abort a recording still being recorded (nothing saved) / drop an unread result;
-             one already being saved is not aborted (the message says so).
-    ~/confirm  confirm the recording last returned by ~/get (the caller's cycle went as
-             planned): only then its .json says valid true and a CSV row valid True is
-             added. Unconfirmed recordings stay on disk but are not valid. Retryable.
+Service ~/command (analog_discovery_ros2/srv/AeRecordCommand), command:
+    start    start a recording of duration_s at sample_rate_hz on CH1 (Record mode);
+             answers once samples arrive, with its recording_id. Refused while one runs.
+    get      wait (up to duration_s + get_margin_s) until the last started recording is
+             saved; answers its recording_id, ae_spectrum_integral_v2 (ROS 1 formula, V^2)
+             and file. success is false when samples were lost, the file could not be
+             written, etc.
+    confirm  (recording_id = the one get returned) the caller's cycle went as planned:
+             only then its .json says valid true and a CSV row valid True is added.
+             Unconfirmed recordings stay on disk but are not valid. Retryable.
+    stop     abort a recording still being recorded (nothing saved) / drop an unread
+             result; one already being saved is not aborted (the message says so).
 Topic:
     ~/ae_spectrum_integral_v2  std_msgs/Float64, for each confirmed recording (rosbag)
 
-Each recording: <record_dir>/ae_<YYYYmmdd_HHMMSS>_<index>.npy (float32, V) and .json
+Each recording: <record_dir>/<recording_id>.npy (float32, V) and .json, recording_id =
+ae_<node start YYYYmmdd_HHMMSS>_<index>
 (rate, start time, lost samples, value). The device is opened at start-up and kept;
 the triggered-capture node (analog_discovery_node.py) cannot run at the same time.
 For looking at and recording data; nothing here commands a robot.
@@ -28,11 +30,11 @@ import rclpy
 from analog_discovery.ae_record import AeRecorder, ROS1_FREQUENCY_THRESHOLD_HZ, ROS1_SKIP_SAMPLES
 from analog_discovery.dwf import DwfError
 from analog_discovery.scope import AnalogDiscoveryScope, DEFAULT_SETTLE_S, RecordSettings
+from analog_discovery_ros2.srv import AeRecordCommand
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Float64
-from std_srvs.srv import Trigger
 
 
 def create_scope(backend, serial, config_index):
@@ -86,11 +88,8 @@ class AeRecordNode(Node):
         except BaseException:
             self.scope.close()
             raise
-        group = ReentrantCallbackGroup()
-        self.create_service(Trigger, '~/start', self._start, callback_group=group)
-        self.create_service(Trigger, '~/get', self._get, callback_group=group)
-        self.create_service(Trigger, '~/stop', self._stop, callback_group=group)
-        self.create_service(Trigger, '~/confirm', self._confirm, callback_group=group)
+        self.create_service(AeRecordCommand, '~/command', self._command,
+                            callback_group=ReentrantCallbackGroup())
         self.get_logger().info(
             f'{self.scope.device_name}: CH1 +-{s.ch1_range_peak_v:g} V, {s.num_samples()} samples '
             f'at {s.sample_rate_hz:g} Hz ({s.duration_s:g} s) per recording -> {record_dir}'
@@ -100,36 +99,29 @@ class AeRecordNode(Node):
         if result.confirmed:
             self.pub.publish(Float64(data=result.value_v2))
 
-    def _start(self, _req, res):
-        res.success, res.message = self.recorder.start(self.start_timeout_s)
+    def _command(self, req, res):
+        res.ae_spectrum_integral_v2 = math.nan
+        if req.command == 'start':
+            res.success, res.message, res.recording_id = self.recorder.start(self.start_timeout_s)
+        elif req.command == 'get':
+            ok, result = self.recorder.get(self.scope.record_settings.duration_s + self.get_margin_s)
+            if isinstance(result, str):
+                res.success, res.message = False, result
+            else:
+                res.success, res.message = ok, result.message()
+                res.recording_id, res.file = result.recording_id, result.file
+                res.ae_spectrum_integral_v2 = result.value_v2
+        elif req.command == 'confirm':
+            res.success, res.message = self.recorder.confirm(req.recording_id)
+            res.recording_id = req.recording_id
+        elif req.command == 'stop':
+            res.success, res.message = self.recorder.stop()
+        else:
+            res.success, res.message = False, f'unknown command {req.command!r} (start|get|confirm|stop)'
         if res.success:  # rclpy: one call site must keep one severity
-            self.get_logger().info(f'start: {res.message}')
+            self.get_logger().info(f'{req.command}: {res.message}')
         else:
-            self.get_logger().error(f'start: {res.message}')
-        return res
-
-    def _get(self, _req, res):
-        timeout_s = self.scope.record_settings.duration_s + self.get_margin_s
-        ok, result = self.recorder.get(timeout_s)
-        if isinstance(result, str):
-            res.success, res.message = False, result
-        else:
-            res.success, res.message = ok, result.message()
-        if not res.success:
-            self.get_logger().error(f'get: {res.message}')
-        return res
-
-    def _stop(self, _req, res):
-        res.success, res.message = self.recorder.stop()
-        self.get_logger().info(f'stop: {res.message}')
-        return res
-
-    def _confirm(self, _req, res):
-        res.success, res.message = self.recorder.confirm()
-        if res.success:
-            self.get_logger().info(f'confirm: {res.message}')
-        else:
-            self.get_logger().error(f'confirm: {res.message}')
+            self.get_logger().error(f'{req.command}: {res.message}')
         return res
 
     def shutdown(self):
@@ -137,7 +129,8 @@ class AeRecordNode(Node):
         ok, message = self.recorder.stop(
             timeout_s=self.scope.record_settings.duration_s + self.get_margin_s)
         if not ok:
-            self.get_logger().error(f'shutdown: {message}; its files may be incomplete')
+            self.get_logger().error(f'shutdown: {message}; waiting for it to finish')
+            self.recorder.join()  # a save still running would be cut off by the exit
         self.scope.close()
 
 

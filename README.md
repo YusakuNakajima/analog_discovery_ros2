@@ -140,26 +140,32 @@ NAS に CSV を書き、`analysis_ae.py` が値を出していた）の置き換
 ```bash
 ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/path/to/ae feature_log_csv:=/path/to/ae.csv
 ros2 launch analog_discovery_ros2 ae_record.launch.py record_dir:=/tmp/ae backend:=mock   # 実機なし
-ros2 service call /ae_recorder/start std_srvs/srv/Trigger   # 装置からサンプルが届いたら返る
-ros2 service call /ae_recorder/get std_srvs/srv/Trigger     # 保存と計算を待って値を返す
-ros2 service call /ae_recorder/confirm std_srvs/srv/Trigger # その収録を有効にする
-ros2 service call /ae_recorder/stop std_srvs/srv/Trigger    # 収録中なら中止（保存しない）
+C=analog_discovery_ros2/srv/AeRecordCommand
+ros2 service call /ae_recorder/command $C "{command: start}"   # 装置からサンプルが届いたら返る（recording_id 付き）
+ros2 service call /ae_recorder/command $C "{command: get}"     # 保存と計算を待って値を返す
+ros2 service call /ae_recorder/command $C "{command: confirm, recording_id: ae_..._0001}"  # その収録を有効にする
+ros2 service call /ae_recorder/command $C "{command: stop}"    # 収録中なら中止（保存しない）
 ```
 
-| サービス / トピック | 内容 |
+`~/command`（`analog_discovery_ros2/srv/AeRecordCommand`）の `command`:
+
+| command | 内容 |
 | --- | --- |
-| `~/start` | 収録を始める。収録中・保存中は断る。空き容量が1回分（＋200 MB）より少なければ断る |
-| `~/get` | 直前に始めた収録の保存・計算が終わるまで待ち（`duration_s` + `get_margin_s`）、`ae_spectrum_integral=... V^2 file=...` を返す。サンプルの欠落・保存の失敗があれば `success: false`。同じ収録は2回返さず、待っている間に次の `start` が来たら何も返さない |
-| `~/stop` | 収録中なら中止する（何も保存しない）。収録が終わって保存中なら中止せず、保存を待ってそう返す。読まれていない結果は捨てる（ファイルは残る） |
-| `~/confirm` | 直前に `~/get` が返した収録を「有効」にする（`.json` の `confirmed`・`valid` を true に、CSV に同じ番号で `valid` True の行を追加）。呼び出し側のサイクルが予定どおり終わったときに呼ぶ。完全な収録だけ確認できる。書き込みに失敗したら再実行できる |
+| `start` | 収録を始め、装置からサンプルが届いたら `recording_id` を返す。収録中・保存中は断る。空き容量が1回分（＋200 MB）より少なければ断る |
+| `get` | 最後に始めた収録の保存・計算が終わるまで待ち（`duration_s` + `get_margin_s`）、`recording_id`・`ae_spectrum_integral_v2`（V²）・`file` を返す。サンプルの欠落・保存の失敗があれば `success: false`。同じ収録は2回返さず、待っている間に次の `start` が来たら何も返さない |
+| `confirm` | `recording_id`（`get` が返したもの。必須）の収録を「有効」にする（`.json` の `confirmed`・`valid` を true に、CSV に同じ `recording_id` で `valid` True の行を追加）。呼び出し側のサイクルが予定どおり終わったときに呼ぶ。最後に `get` が返した収録で、完全なものだけ確認できる（遅れて届いた別の収録への要求は断る）。書き込みに失敗したら再実行できる |
+| `stop` | 収録中なら中止する（何も保存しない）。収録が終わって保存中なら中止せず、保存を待ってそう返す。読まれていない結果は捨てる（ファイルは残る） |
+
+| トピック | 内容 |
+| --- | --- |
 | `~/ae_spectrum_integral_v2` | `std_msgs/Float64`。確認された収録ごと。rosbag 用 |
 
-- **保存した収録は、`~/confirm` されるまで有効ではない**（`.json` の `complete`: 欠落なく保存・計算できた、`confirmed`: 呼び出し側が確認した、
+- **保存した収録は、`confirm` されるまで有効ではない**（`.json` の `complete`: 欠落なく保存・計算できた、`confirmed`: 呼び出し側が確認した、
   `valid` = 両方）。CSV は保存時に `valid` False の行、確認時に同じ番号で `valid` True の行を足すので、解析では `valid` True の行（または
   `valid: true` の `.json`）だけを使う。`.json` が正で、CSV はその記録（同じ番号は最後の行が有効）。呼び出し側が失敗・中断・応答を失っても、その収録は後始末なしで無効のまま残る。
 - ノードの終了時は、収録中なら中止し、保存中なら保存の終わりを待つ。
 - `frequency_threshold_hz` は 0 以上、サンプリング周波数の半分未満でないと起動しない（超えるビンが無いと値が常に 0 になる）。
-- 1回の収録: `<record_dir>/ae_<YYYYmmdd_HHMMSS>_<番号>.npy`（float32、V、CH1）と `.json`（サンプリング周波数、
+- 1回の収録: `<record_dir>/<recording_id>.npy`（`recording_id` = `ae_<ノード起動時刻 YYYYmmdd_HHMMSS>_<番号>`。再起動しても重複しない）（float32、V、CH1）と `.json`（サンプリング周波数、
   開始時刻（最初のサンプルがホストに届いた時刻。サンプル0はその数 ms 前。壁時計と ROS 時刻）、欠落サンプル数、レンジ、値と式のパラメータ）。`get` を呼ばなくても保存する。既存のファイルは上書きしない。
 - 値（`ae_spectrum_integral`、V²）: 先頭 `skip_samples`（200012 = 0.1 s）を捨て、`rfft` の 100 kHz を超えるビンの
   `(|X|·2/N)²` の和。ROS 1 の `spectrum_integration`（`fft` + `fftfreq`）と同じ値になることを `test/test_ae_record.py` が確かめる。

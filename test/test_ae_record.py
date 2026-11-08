@@ -214,7 +214,7 @@ def mock_recorder(tmp_path, realtime=False, duration_s=0.3, lost=0, **kw):
 
 def test_a_recording_is_saved_with_its_value(tmp_path):
     rec, scope, results = mock_recorder(tmp_path)
-    ok, message = rec.start()
+    ok, message, _ = rec.start()
     assert ok, message
     ok, result = rec.get(5.0)
     assert ok and result.complete and not result.confirmed and not result.error
@@ -255,7 +255,7 @@ def test_lost_samples_make_the_value_invalid_but_the_file_is_kept(tmp_path):
     assert os.path.exists(result.file)
     assert json.load(open(result.file[:-4] + '.json'))['lost_samples'] == 5
     assert list(csv.DictReader(open(tmp_path / 'ae.csv')))[0]['complete'] == 'False'
-    ok, message = rec.confirm()
+    ok, message = rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')
     assert not ok and 'not complete' in message
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is False
 
@@ -263,7 +263,7 @@ def test_lost_samples_make_the_value_invalid_but_the_file_is_kept(tmp_path):
 def test_start_is_refused_while_recording_and_stop_aborts_without_saving(tmp_path):
     rec, _, results = mock_recorder(tmp_path, realtime=True, duration_s=5.0)
     assert rec.start()[0]
-    ok, message = rec.start()
+    ok, message, _ = rec.start()
     assert not ok and 'still recording' in message
     t0 = time.monotonic()
     assert rec.stop() == (True, 'recording 1 aborted (nothing saved)')
@@ -285,7 +285,7 @@ def test_start_is_refused_without_disk_space(tmp_path, monkeypatch):
     rec, _, _ = mock_recorder(tmp_path)
     monkeypatch.setattr(ae_record.shutil, 'disk_usage',
                         lambda path: type('U', (), {'free': 10 * 1024 * 1024})())
-    ok, message = rec.start()
+    ok, message, _ = rec.start()
     assert not ok and 'GB free' in message and not rec.busy()
 
 
@@ -295,28 +295,42 @@ def test_a_device_error_is_reported_by_start(tmp_path):
     def broken(**kw):
         raise d.DwfError('FDwfAnalogInConfigure failed: fake')
     scope.record = broken
-    ok, message = rec.start()
+    ok, message, _ = rec.start()
     assert not ok and 'fake' in message
     ok, result = rec.get(1.0)
     assert not ok and 'fake' in result.error and result.file == ''
 
 
-def test_files_are_never_overwritten(tmp_path, monkeypatch):
+def test_files_are_never_overwritten(tmp_path):
     rec, _, _ = mock_recorder(tmp_path)
     rec.start()
     first = rec.get(5.0)[1].file
-    rec._index = 0  # same index and (within the second) the same name again
-    real_now = ae_record.datetime.datetime
-
-    class SameSecond(real_now):
-        @classmethod
-        def now(cls, tz=None):
-            return real_now.strptime(os.path.basename(first)[3:18], '%Y%m%d_%H%M%S')
-    monkeypatch.setattr(ae_record.datetime, 'datetime', SameSecond)
+    rec._index = 0  # e.g. a restart within the same second: same recording_id again
     rec.start()
     ok, result = rec.get(5.0)
     assert not ok and 'not saved' in result.error
+    assert os.path.exists(first)
 
+
+def test_recording_ids_differ_after_a_restart(tmp_path, monkeypatch):
+    first, _, _ = mock_recorder(tmp_path)
+    first.session = '20261109_080000'
+    second, _, _ = mock_recorder(tmp_path)
+    second.session = '20261109_080001'
+    assert first.recording_id(1) != second.recording_id(1)
+    assert first.recording_id(1) == 'ae_20261109_080000_0001'
+
+
+def test_confirm_refuses_another_recording_id(tmp_path):
+    rec, _, _ = mock_recorder(tmp_path)
+    ok, _, first_id = rec.start()
+    rec.get(5.0)
+    ok, _, second_id = rec.start()
+    ok, second = rec.get(5.0)
+    ok, message = rec.confirm(first_id)  # a late confirm of the first recording
+    assert not ok and 'not the recording last returned by get' in message
+    assert json.load(open(second.file[:-4] + '.json'))['valid'] is False
+    assert rec.confirm(second_id)[0]
 
 def test_record_dir_and_skip_are_checked(tmp_path):
     scope = MockScope(realtime=False)
@@ -401,17 +415,17 @@ def test_an_aborted_start_is_not_reported_as_started(tmp_path):
     def aborted(**kw):
         raise RecordingAborted('stopped')
     scope.record = aborted
-    ok, message = rec.start()
+    ok, message, _ = rec.start()
     assert not ok and 'aborted' in message
 
 
 def test_confirm_makes_the_last_read_recording_valid(tmp_path):
     rec, _, results = mock_recorder(tmp_path)
-    assert not rec.confirm()[0]  # nothing read yet
+    assert not rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]  # nothing read yet
     rec.start()
     ok, result = rec.get(5.0)
     assert ok
-    ok, message = rec.confirm()
+    ok, message = rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')
     assert ok and 'confirmed' in message
     meta = json.load(open(result.file[:-4] + '.json'))
     assert meta['confirmed'] is True and meta['valid'] is True
@@ -419,7 +433,7 @@ def test_confirm_makes_the_last_read_recording_valid(tmp_path):
     assert [(r['index'], r['valid'], r['note']) for r in rows] == [
         ('1', 'False', 'saved'), ('1', 'True', 'confirmed')]
     assert results[-1].confirmed
-    ok, message = rec.confirm()  # idempotent: no third CSV row
+    ok, message = rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')  # idempotent: no third CSV row
     assert ok and 'already confirmed' in message
     assert len(list(csv.DictReader(open(tmp_path / 'ae.csv')))) == 2
 
@@ -428,10 +442,10 @@ def test_an_unread_or_unconfirmed_recording_stays_not_valid(tmp_path):
     rec, _, _ = mock_recorder(tmp_path)
     rec.start()
     rec._thread.join()  # saved, never read (the caller failed or was stopped)
-    assert not rec.confirm()[0]
+    assert not rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
     rec.start()  # the next cycle; the first one stays as it is
     ok, second = rec.get(5.0)
-    assert ok and rec.confirm()[0]
+    assert ok and rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
     metas = sorted(f for f in os.listdir(tmp_path / 'ae') if f.endswith('.json'))
     valid = [json.load(open(tmp_path / 'ae' / f))['valid'] for f in metas]
     assert valid == [False, True]
@@ -443,7 +457,7 @@ def test_confirm_is_bound_to_the_recording_read_even_after_a_new_start(tmp_path)
     ok, first = rec.get(5.0)
     rec.start()
     rec._thread.join()
-    assert rec.confirm()[0]
+    assert rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
     assert json.load(open(first.file[:-4] + '.json'))['valid'] is True
     later = rec.get(5.0)[1]
     assert json.load(open(later.file[:-4] + '.json'))['valid'] is False
@@ -455,11 +469,11 @@ def test_a_failed_confirmation_can_be_repeated(tmp_path, monkeypatch):
     ok, result = rec.get(5.0)
     real = rec._log_row
     monkeypatch.setattr(rec, '_log_row', lambda *a, **k: (_ for _ in ()).throw(OSError('disk full')))
-    ok, message = rec.confirm()
+    ok, message = rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')
     assert not ok and 'disk full' in message and 'try again' in message
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is False  # rolled back
     monkeypatch.setattr(rec, '_log_row', real)
-    assert rec.confirm()[0]
+    assert rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is True
 
 
@@ -493,7 +507,7 @@ def test_a_failed_csv_row_leaves_the_metadata_not_valid(tmp_path):
     assert not ok and 'CSV row not written' in result.error and result.file
     meta = json.load(open(result.file[:-4] + '.json'))
     assert meta['complete'] is False and any('CSV' in e for e in meta['errors'])
-    assert not rec.confirm()[0]
+    assert not rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
 
 
 def test_configure_record_keeps_the_range_the_device_took():
@@ -519,11 +533,11 @@ def test_a_concurrent_confirm_waits_for_the_first_to_be_written(tmp_path, monkey
         raise OSError('disk full')
     monkeypatch.setattr(rec, '_log_row', slow_then_fail)
     first = []
-    t = threading.Thread(target=lambda: first.append(rec.confirm()))
+    t = threading.Thread(target=lambda: first.append(rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')))
     t.start()
     assert writing.wait(5.0)
     second = []
-    t2 = threading.Thread(target=lambda: second.append(rec.confirm()))
+    t2 = threading.Thread(target=lambda: second.append(rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')))
     t2.start()
     time.sleep(0.1)
     assert second == []  # not answered 'already confirmed' while the first is writing
@@ -531,7 +545,7 @@ def test_a_concurrent_confirm_waits_for_the_first_to_be_written(tmp_path, monkey
     release.set()
     t.join(5.0)
     t2.join(5.0)
-    assert not first[0][0] and second[0][0] and second[0][1] == 'recording 1 confirmed'
+    assert not first[0][0] and second[0][0] and second[0][1].endswith('_0001 confirmed')
 
 
 def test_a_failed_metadata_confirmation_is_logged_as_not_valid(tmp_path, monkeypatch):
@@ -540,13 +554,13 @@ def test_a_failed_metadata_confirmation_is_logged_as_not_valid(tmp_path, monkeyp
     ok, result = rec.get(5.0)
     real = rec._write_meta
     monkeypatch.setattr(rec, '_write_meta', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
-    assert not rec.confirm()[0]
+    assert not rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
     rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
     assert [(r['valid'], r['note'][:14]) for r in rows] == [
         ('False', 'saved'), ('True', 'confirmed'), ('False', 'confirm failed')]  # last row wins
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is False
     monkeypatch.setattr(rec, '_write_meta', real)
-    assert rec.confirm()[0]
+    assert rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is True
 
 
@@ -559,6 +573,6 @@ def test_a_stop_right_after_the_last_read_saves_nothing(tmp_path):
         rec._stop.set()  # stop() took the lock after the read loop, before the save
         return rec_
     scope.record = record_then_stop
-    ok, message = rec.start()
+    ok, message, _ = rec.start()
     rec._thread.join()
     assert os.listdir(tmp_path / 'ae') == []

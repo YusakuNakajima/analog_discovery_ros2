@@ -9,6 +9,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ScopeCapture.msg"
   "msg/AeHit.msg"
   "msg/AeActivity.msg"
+  "srv/AeRecordCommand.srv"
   DEPENDENCIES std_msgs
 )
 
