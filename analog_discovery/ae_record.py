@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import threading
+import uuid
 
 import numpy as np
 
@@ -77,7 +78,9 @@ class RecordResult:
     corrupted_samples: int = 0
     value_v2: float = float('nan')
     complete: bool = False  # saved, no lost / corrupted samples, value computed
+    duration_s: float = 0.0  # s actually recorded (num_samples / sample_rate_hz)
     confirmed: bool = False  # the caller confirmed it matches what it measured (confirm())
+    csv_confirmed: bool = False  # the CSV row of the confirmation is written too
     error: str = ''
     start_wall_time: str = ''
     start_ros_time_s: float = float('nan')
@@ -120,10 +123,11 @@ class AeRecorder:
         self._lock = threading.Lock()
         self._confirm_lock = threading.Lock()
         self._thread = None
-        self._stop = threading.Event()
+        self._stop = threading.Event()  # of the current recording (a new one per start)
         self._index = 0
         # in every recording_id and file name, so that ids do not repeat after a restart
-        self.session = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.session = (datetime.datetime.now().strftime('%Y%m%d_%H%M%S') + '_'
+                        + uuid.uuid4().hex[:8])
         self._result = None  # RecordResult of the last finished recording, until get()
         self._last_read = None  # RecordResult last returned by get, until confirmed
         self._phase = 'idle'  # recording | saving (while the thread runs)
@@ -149,15 +153,15 @@ class AeRecorder:
                                f'needs {needed / 1e9:.2f} GB'), ''
             self._index += 1
             index = self._index
-            self._stop.clear()
+            stop = self._stop = threading.Event()
             self._phase = 'recording'
             started = threading.Event()
             info = {}
-            self._thread = threading.Thread(target=self._run, args=(index, started, info),
+            self._thread = threading.Thread(target=self._run, args=(index, started, info, stop),
                                             daemon=True)
             self._thread.start()
         if not started.wait(timeout_s):
-            self._stop.set()  # a recording that starts later is aborted, not saved
+            stop.set()  # this recording only: if it starts later, it is aborted, not saved
             return False, f'no samples from the device within {timeout_s} s', ''
         if 'error' in info:
             return False, info['error'], ''
@@ -223,27 +227,27 @@ class AeRecorder:
             if result is None or result.recording_id != recording_id:
                 return False, (f'{recording_id!r} is not the recording last returned by get '
                                f'({result.recording_id if result else "none"}); not confirmed')
-            if result.confirmed:
+            if result.confirmed and result.csv_confirmed:
                 return True, f'recording {result.recording_id} already confirmed'
             if not result.complete:
                 return False, f'recording {result.recording_id} is not complete ({result.error})'
-            confirmed = dataclasses.replace(result, confirmed=True)
-            # The .json decides; it is written last. The CSV is a log (its last row of an
-            # index wins): a failed .json write is followed by a valid False row.
-            try:
-                self._log_row(confirmed, note='confirmed')
-            except Exception as e:
-                return False, f'recording {result.recording_id}: confirmation not written ({e}); try again'
-            try:
-                self._write_meta(result.file, {'confirmed': True, 'valid': True})
-            except Exception as e:
+            # The .json decides and is written first; the CSV row follows (a crash in
+            # between leaves the CSV saying not valid, never the other way round).
+            rid = result.recording_id
+            if not result.confirmed:
                 try:
-                    self._log_row(result, note=f'confirm failed: {e}')
-                except Exception:
-                    pass
-                return False, f'recording {result.recording_id}: confirmation not written ({e}); try again'
-            result.confirmed = True  # only once both are written
-            self.on_result(result)
+                    self._write_meta(result.file, {'confirmed': True, 'valid': True})
+                except Exception as e:
+                    return False, f'recording {rid}: confirmation not written ({e}); try again'
+                result.confirmed = True
+                self.on_result(result)
+            if not result.csv_confirmed:
+                try:
+                    self._log_row(result, note='confirmed')
+                except Exception as e:
+                    return False, (f'recording {rid}: confirmed in its .json, but the CSV row '
+                                   f'was not written ({e}); try again')
+                result.csv_confirmed = True
             return True, f'recording {result.recording_id} confirmed'
 
     def _take_result(self, index):
@@ -268,7 +272,7 @@ class AeRecorder:
         s = self.scope.record_settings
         return f'{s.num_samples()} samples at {s.sample_rate_hz:g} Hz = {s.duration_s:g} s'
 
-    def _run(self, index, started, info):
+    def _run(self, index, started, info, stop):
         wall = {}
 
         def on_start():
@@ -277,7 +281,7 @@ class AeRecorder:
             started.set()
 
         try:
-            rec = self.scope.record(should_stop=self._stop.is_set, now=on_start)
+            rec = self.scope.record(should_stop=stop.is_set, now=on_start)
         except RecordingAborted:
             self.log(f'recording {index} aborted (nothing saved)')
             info['error'] = f'recording {index} aborted'
@@ -290,7 +294,7 @@ class AeRecorder:
                                       error=info['error']))
             return
         with self._lock:
-            if self._stop.is_set():  # stop came after the last read, before the save
+            if stop.is_set():  # stop came after the last read, before the save
                 info['error'] = f'recording {index} aborted'
                 started.set()
                 self.log(f'recording {index} aborted (nothing saved)')
@@ -298,6 +302,7 @@ class AeRecorder:
             self._phase = 'saving'  # from here stop no longer aborts
         result = RecordResult(index=index, recording_id=self.recording_id(index), file='',
                               sample_rate_hz=rec.sample_rate_hz,
+                              duration_s=len(rec.ch1_v) / rec.sample_rate_hz,
                               num_samples=len(rec.ch1_v), lost_samples=rec.lost_samples,
                               corrupted_samples=rec.corrupted_samples)
         errors = []

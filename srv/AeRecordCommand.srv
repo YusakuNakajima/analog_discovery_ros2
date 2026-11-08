@@ -7,3 +7,4 @@ string message
 string recording_id               # start / get / confirm: the recording this answer is about
 float64 ae_spectrum_integral_v2   # get: V^2 (ROS 1 formula); NaN when not computed
 string file                       # get: .npy path ('' when not saved)
+float64 duration_s                # get: s actually recorded (0 when not recorded)

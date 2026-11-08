@@ -3,6 +3,7 @@
 import csv
 import ctypes
 import json
+import re
 import os
 import sys
 import threading
@@ -314,11 +315,9 @@ def test_files_are_never_overwritten(tmp_path):
 
 def test_recording_ids_differ_after_a_restart(tmp_path, monkeypatch):
     first, _, _ = mock_recorder(tmp_path)
-    first.session = '20261109_080000'
-    second, _, _ = mock_recorder(tmp_path)
-    second.session = '20261109_080001'
+    second, _, _ = mock_recorder(tmp_path)  # a restart within the same second
     assert first.recording_id(1) != second.recording_id(1)
-    assert first.recording_id(1) == 'ae_20261109_080000_0001'
+    assert re.fullmatch(r'ae_\d{8}_\d{6}_[0-9a-f]{8}_0001', first.recording_id(1))
 
 
 def test_confirm_refuses_another_recording_id(tmp_path):
@@ -467,15 +466,17 @@ def test_a_failed_confirmation_can_be_repeated(tmp_path, monkeypatch):
     rec, _, _ = mock_recorder(tmp_path)
     rec.start()
     ok, result = rec.get(5.0)
+    rid = result.recording_id
     real = rec._log_row
     monkeypatch.setattr(rec, '_log_row', lambda *a, **k: (_ for _ in ()).throw(OSError('disk full')))
-    ok, message = rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')
-    assert not ok and 'disk full' in message and 'try again' in message
-    assert json.load(open(result.file[:-4] + '.json'))['valid'] is False  # rolled back
-    monkeypatch.setattr(rec, '_log_row', real)
-    assert rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
+    ok, message = rec.confirm(rid)
+    # the .json (authoritative) is confirmed first; only the CSV row is missing
+    assert not ok and 'CSV row' in message and 'try again' in message
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is True
-
+    monkeypatch.setattr(rec, '_log_row', real)
+    assert rec.confirm(rid)[0]
+    rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
+    assert [r['valid'] for r in rows] == ['False', 'True']
 
 def test_an_old_stop_does_not_drop_a_newer_result(tmp_path):
     rec, _, _ = mock_recorder(tmp_path)
@@ -545,24 +546,43 @@ def test_a_concurrent_confirm_waits_for_the_first_to_be_written(tmp_path, monkey
     release.set()
     t.join(5.0)
     t2.join(5.0)
-    assert not first[0][0] and second[0][0] and second[0][1].endswith('_0001 confirmed')
+    assert not first[0][0] and second[0][0]
+    assert json.load(open(rec._last_read.file[:-4] + '.json'))['valid'] is True
 
 
-def test_a_failed_metadata_confirmation_is_logged_as_not_valid(tmp_path, monkeypatch):
+def test_a_failed_metadata_confirmation_leaves_both_not_valid(tmp_path, monkeypatch):
     rec, _, _ = mock_recorder(tmp_path)
     rec.start()
     ok, result = rec.get(5.0)
     real = rec._write_meta
     monkeypatch.setattr(rec, '_write_meta', lambda *a: (_ for _ in ()).throw(OSError('disk full')))
-    assert not rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
+    assert not rec.confirm(result.recording_id)[0]
     rows = list(csv.DictReader(open(tmp_path / 'ae.csv')))
-    assert [(r['valid'], r['note'][:14]) for r in rows] == [
-        ('False', 'saved'), ('True', 'confirmed'), ('False', 'confirm failed')]  # last row wins
+    assert [r['valid'] for r in rows] == ['False']  # no valid row before the .json says so
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is False
     monkeypatch.setattr(rec, '_write_meta', real)
-    assert rec.confirm(rec._last_read.recording_id if rec._last_read else 'x')[0]
+    assert rec.confirm(result.recording_id)[0]
     assert json.load(open(result.file[:-4] + '.json'))['valid'] is True
 
+
+def test_a_timed_out_start_only_stops_its_own_recording(tmp_path):
+    rec, scope, _ = mock_recorder(tmp_path)
+    real = scope.record
+    gate = threading.Event()
+
+    def slow_start(**kw):
+        gate.wait(5.0)  # the first samples come late
+        return real(**kw)
+    scope.record = slow_start
+    ok, message, _ = rec.start(timeout_s=0.05)
+    assert not ok
+    gate.set()
+    rec._thread.join(5.0)  # the late recording is aborted, nothing saved
+    scope.record = real
+    ok, _, rid = rec.start()
+    assert ok
+    ok, result = rec.get(5.0)
+    assert ok and result.recording_id == rid  # not stopped by the first start's timeout
 
 def test_a_stop_right_after_the_last_read_saves_nothing(tmp_path):
     rec, scope, _ = mock_recorder(tmp_path)

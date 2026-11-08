@@ -111,6 +111,7 @@ class AeRecordNode(Node):
                 res.success, res.message = ok, result.message()
                 res.recording_id, res.file = result.recording_id, result.file
                 res.ae_spectrum_integral_v2 = result.value_v2
+                res.duration_s = result.duration_s
         elif req.command == 'confirm':
             res.success, res.message = self.recorder.confirm(req.recording_id)
             res.recording_id = req.recording_id
