@@ -113,6 +113,7 @@ class AnalogDiscoveryScope:
         self.settings = None
         self.device_name = None
         self.max_buffer_samples = None
+        self.record_settings = None
 
     @property
     def dwf(self):
@@ -197,6 +198,28 @@ class AnalogDiscoveryScope:
 
     def __exit__(self, *exc):
         self.close()
+
+    # --- continuous recording (see RecordSettings) ---
+
+    def configure_record(self, settings, settle_s=DEFAULT_SETTLE_S):
+        """Set up a continuous CH1 recording (acqmodeRecord); return the device's rate (Hz).
+
+        The number of samples (duration_s x sample_rate_hz asked for) is kept; when the
+        device rounds the rate, record_settings.duration_s follows it.
+        """
+        return _configure_record(self, settings, settle_s)
+
+    def record(self, should_stop=None, now=None, poll_period_s=0.001,
+               stall_timeout_s=None):
+        """Start the configured recording and read it to the end (blocking); return a Recording.
+
+        now() (if given) is called when the first samples arrive (proof that the device
+        records; sample 0 is earlier by the samples already delivered, a few ms).
+        should_stop() is checked between reads; RecordingAborted is raised when it is true.
+        Can be called again for the next recording with the same settings.
+        """
+        return _record(self, should_stop, now, poll_period_s,
+                       RECORD_STALL_TIMEOUT_S if stall_timeout_s is None else stall_timeout_s)
 
     # --- acquisition ---
 
@@ -292,3 +315,134 @@ class AnalogDiscoveryScope:
                        trigger_index=min(max(index, 0), s.buffer_samples - 1),
                        auto_triggered=bool(auto.value), ch1_v=data[0], ch2_v=data[1],
                        device_time=(sec.value, tick.value, tps.value), done_time=done_time)
+
+
+# --- continuous recording (acqmodeRecord) ---
+
+# Recording fails when the device delivers no sample for this long after it started.
+RECORD_STALL_TIMEOUT_S = 2.0
+
+
+@dataclasses.dataclass
+class RecordSettings:
+    """One continuous recording of CH1 (acqmodeRecord), started without a trigger.
+
+    Unlike a triggered capture, the samples are streamed to the host while the
+    device records, so the length is limited by host memory, not the device buffer.
+    Samples the host did not read in time are lost (counted, the gap stays 0 V).
+    """
+
+    sample_rate_hz: float = 2e6  # ROS 1 AE recording: 5e-7 s per sample
+    duration_s: float = 14.0  # as config/ae_record.yaml
+    ch1_range_peak_v: float = 2.5  # +- V; AD3 has +-2.5 V and +-25 V
+
+    def validate(self):
+        for name in ('sample_rate_hz', 'duration_s', 'ch1_range_peak_v'):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0.0):
+                raise ValueError(f'{name} must be a positive number')
+        if self.sample_rate_hz > MAX_SAMPLE_RATE_HZ:
+            raise ValueError(f'sample_rate_hz must be at most {MAX_SAMPLE_RATE_HZ:g}')
+        if self.num_samples() < 2:
+            raise ValueError('duration_s x sample_rate_hz must give at least 2 samples')
+
+    def num_samples(self):
+        return round(self.duration_s * self.sample_rate_hz)
+
+
+@dataclasses.dataclass
+class Recording:
+    sample_rate_hz: float
+    ch1_v: np.ndarray  # float32, V; num_samples long
+    lost_samples: int  # the device overwrote them before the host read them (left at 0 V)
+    corrupted_samples: int  # the SDK flagged them as possibly overwritten while read
+    start_time: object = None  # value of record(now=...) taken right after the start
+
+
+class RecordingAborted(RuntimeError):
+    """record() was stopped through should_stop."""
+
+
+def _configure_record(scope, settings, settle_s):
+    if not (math.isfinite(settle_s) and settle_s >= 0.0):
+        raise ValueError('settle_s must be a finite, non-negative number')
+    settings.validate()
+    h, call = scope._hdwf, scope.dwf.call
+    call('FDwfAnalogInReset', h)
+    call('FDwfAnalogInChannelEnableSet', h, _int(0), _int(1))
+    call('FDwfAnalogInChannelEnableSet', h, _int(1), _int(0))
+    call('FDwfAnalogInChannelRangeSet', h, _int(0), ctypes.c_double(2 * settings.ch1_range_peak_v))
+    call('FDwfAnalogInChannelOffsetSet', h, _int(0), ctypes.c_double(0.0))
+    actual = ctypes.c_double()
+    call('FDwfAnalogInChannelRangeGet', h, _int(0), ctypes.pointer(actual))
+    if actual.value / 2 < settings.ch1_range_peak_v * 0.999:
+        raise ValueError(f'ch1: device range +-{actual.value / 2:g} V is narrower than '
+                         f'the requested +-{settings.ch1_range_peak_v:g} V')
+    call('FDwfAnalogInAcquisitionModeSet', h, _int(d.ACQMODE_RECORD))
+    call('FDwfAnalogInFrequencySet', h, ctypes.c_double(settings.sample_rate_hz))
+    rate = ctypes.c_double()
+    call('FDwfAnalogInFrequencyGet', h, ctypes.pointer(rate))
+    # keep the number of samples asked for; the duration follows the device's rate
+    applied = dataclasses.replace(settings, sample_rate_hz=rate.value,
+                                  duration_s=settings.num_samples() / rate.value,
+                                  ch1_range_peak_v=actual.value / 2)  # the range the device took
+    call('FDwfAnalogInRecordLengthSet', h, ctypes.c_double(applied.duration_s))
+    call('FDwfAnalogInTriggerSourceSet', h, ctypes.c_ubyte(d.TRIGSRC_NONE))
+    call('FDwfAnalogInConfigure', h, _int(1), _int(0))  # apply without starting
+    scope.record_settings = applied
+    time.sleep(settle_s)  # let the input settle after reconfiguring
+    return rate.value
+
+
+def _record(scope, should_stop=None, now=None, poll_period_s=0.001,
+            stall_timeout_s=RECORD_STALL_TIMEOUT_S, clock=time.monotonic):
+    s = scope.record_settings
+    if s is None:
+        raise RuntimeError('configure_record() first')
+    h, call = scope._hdwf, scope.dwf.call
+    n = s.num_samples()
+    out = np.zeros(n, dtype=np.float32)
+    chunk = np.empty(0, dtype=np.float64)
+    state, available, lost, corrupted = ctypes.c_ubyte(), _int(), _int(), _int()
+    got = lost_total = corrupted_total = 0
+    call('FDwfAnalogInConfigure', h, _int(0), _int(1))  # start
+    start_time = None
+    seen_data = False
+    last_progress = clock()
+    try:
+        while got < n:
+            if should_stop is not None and should_stop():
+                raise RecordingAborted('recording stopped')
+            call('FDwfAnalogInStatus', h, _int(1), ctypes.pointer(state))
+            if got == 0 and state.value in (d.STATE_CONFIG, d.STATE_PREFILL, d.STATE_ARMED):
+                pass  # not recording yet
+            else:
+                call('FDwfAnalogInStatusRecord', h, ctypes.pointer(available),
+                     ctypes.pointer(lost), ctypes.pointer(corrupted))
+                lost_total += lost.value
+                corrupted_total += corrupted.value
+                got = min(n, got + lost.value)  # the lost samples come first; they stay 0 V
+                take = min(available.value, n - got)
+                if take > 0:
+                    if len(chunk) < take:
+                        chunk = np.empty(take, dtype=np.float64)
+                    call('FDwfAnalogInStatusData', h, _int(0),
+                         chunk.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), _int(take))
+                    out[got:got + take] = chunk[:take]
+                    got += take
+                if take > 0 or lost.value > 0:
+                    last_progress = clock()
+                    if not seen_data:  # the device is recording: samples arrived
+                        seen_data = True
+                        start_time = now() if now is not None else None
+                if got < n and state.value == d.STATE_DONE and available.value == 0:
+                    raise d.DwfError(f'recording ended after {got} of {n} samples')
+            if got < n:
+                if clock() - last_progress > stall_timeout_s:
+                    raise d.DwfError(f'no samples from the device for {stall_timeout_s} s '
+                                     f'({got} of {n} recorded)')
+                time.sleep(poll_period_s)
+    finally:
+        scope.dwf.lib.FDwfAnalogInConfigure(h, _int(0), _int(0))  # stop; must not raise
+    return Recording(sample_rate_hz=s.sample_rate_hz, ch1_v=out, lost_samples=lost_total,
+                     corrupted_samples=corrupted_total, start_time=start_time)

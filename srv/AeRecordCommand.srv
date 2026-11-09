@@ -1,0 +1,10 @@
+# Command to ae_record_node.py ~/command (see its docstring).
+string command        # start | get | confirm | stop
+string recording_id   # confirm: the recording_id that get returned (required)
+---
+bool success
+string message
+string recording_id               # start / get / confirm: the recording this answer is about
+float64 ae_spectrum_integral_v2   # get: V^2 (ROS 1 formula); NaN when not computed
+string file                       # get: .npy path ('' when not saved)
+float64 duration_s                # get: s actually recorded (0 when not recorded)
