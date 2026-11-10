@@ -25,13 +25,15 @@ AE を粉砕中ずっと記録するための連続収録（Record モード、`
 
 Digilent の Adept Runtime も udev ルールを入れるが、それはコンテナの中に入るだけで、udev が動くホストでは効かない。
 
-### 2. WaveForms と Adept Runtime を落とす（ブラウザで）
+### 2. WaveForms と Adept Runtime
 
-files.digilent.com は Cloudflare の確認があり、curl / wget では取れない。ブラウザで次の2つ
-（Linux、Ubuntu、x86_64 の `.deb`）を `~/onolab_ros2/depends/digilent/` に保存する（`depends/` は git の対象外）。
+確認済みの版（Adept Runtime 2.30.1、WaveForms 3.25.1）の `.deb` を、この repo の
+[GitHub Release](https://github.com/YusakuNakajima/analog_discovery_ros2/releases/tag/digilent-debs-adept2.30.1-waveforms3.25.1)
+に置いている（git には入れていない）。`scripts/install_waveforms.sh` がそこから `vendor/digilent/` に落とし、sha256 を確かめてから入れる。
+Digilent のライセンスは、改変しない再配布を認めている（`vendor/digilent/LICENSE`、Digilent のハードウェアでのみ使う条件付き）。
+ブラウザで落とす必要はない。別の版にするときは [vendor/digilent/README.md](vendor/digilent/README.md) を参照。
 
-- Adept 2 Runtime: <https://digilent.com/reference/software/adept/runtime>（確認済みの版: 2.30.1）
-- WaveForms: <https://digilent.com/reference/software/waveforms/waveforms-3/start>（確認済みの版: 3.25.1）
+onolab_ros2 の `INITIAL_SETUP_ROS_ENVIROMENTS.sh` は、ここまで（インストール）を自動で行う。
 
 ### 3. コンテナ内
 

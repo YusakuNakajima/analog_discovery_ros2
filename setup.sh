@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # One-step setup of analog_discovery_ros2 INSIDE the OnoLab ROS 2 container:
-#   1. install Adept Runtime + WaveForms from the hand-downloaded .debs
+#   1. install Adept Runtime + WaveForms from the .debs in the GitHub Release
 #   2. build the package
 #   3. check that the host udev rule lets this user open the AD3
 #   4. list the attached devices (ad_probe.py; nothing is opened)
 #
-#   ./setup.sh               # .debs in this directory or ~/onolab_ros2/depends/digilent
+#   ./setup.sh               # .debs from the GitHub Release (cached in vendor/digilent)
 #   ./setup.sh --no-verify   # accept .deb versions whose sha256 is not known
 #
 # The host part (udev rule) is separate: run ./udev/setup_udev.sh on the host.
